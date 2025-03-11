@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+sudo=sudo
+tmp_path=/tmp/tmon
+monitor_max_size=16
+
+function _abspath() {
+  if [ -z "$1" ]; then return; fi
+  dirname=$(cd "$(dirname "$1")"; pwd)
+  basename=$(basename "$1")
+  echo "$dirname/$basename"
+}
+
+function _prepare_tmp() {
+  if [ ! -d "$tmp_path" ]; then
+    if [ -e "$tmp_path" ]; then rm -f "$tmp_path"; fi
+    mkdir -p "$tmp_path"
+  fi
+}
+
+function _get_monitor_file() {
+  echo "$tmp_path/monitor"
+}
+
+function _monitor_append() {
+  _prepare_tmp
+  monitor_file=$(_get_monitor_file)
+  if [ ! -f "$monitor_file" ]; then touch "$monitor_file"; fi
+  while [[ $# -gt 0 ]]; do
+    echo "$1" >> "$monitor_file"
+    shift
+  done
+  tail -n "$monitor_max_size" "$monitor_file" >> "$monitor_file"
+}
+
+function _monitor_clear() {
+  monitor_file=$(_get_monitor_file)
+  if [ -f "$monitor_file" ]; then rm -f "$monitor_file"; fi
+}
+
+function _get_monitored_files() {
+  monitor_file=$(_get_monitor_file)
+  if [ ! -f "$monitor_file" ]; then return; fi
+  if [ -z "$1" ]; then num="+0"; else num="$1"; fi
+  tail -n "$num" "$monitor_file" | while IFS= read -r line; do
+    echo "$line"
+  done
+}
+
+function _get_tmp_index() {
+  _prepare_tmp
+  init_index=$RANDOM
+  tmp_index=$(expr $(expr $init_index + 1) % 32768 )
+  while [ $tmp_index != $init_index ]; do
+    tmp_name="${tmp_path}/${tmp_index}"
+    if [ ! -e "$tmp_name" ]; then
+      echo "$tmp_index"
+      return
+    fi
+    tmp_index=$(expr $(expr $tmp_index + 1) % 32768)
+  done
+  echo ""; return
+}
+
+function _start_session() {
+  tmux new -d
+  tmux set status-style "bg=black,fg=green"
+  tmux set pane-border-format "#{pane_title}"
+  tmux set pane-border-status top
+}
+
+function _set_layout() {
+  tmux select-layout main-vertical
+  tmux select-pane -t 0
+  tmux select-pane -T ""
+  tmux resize-pane -x 50%
+}
+
+function _is_attached() {
+  if [ -z "$1" ]; then
+    sessionid=$(tmux display -p '#S') || sessionid=-1
+    if [ ${sessionid} == -1 ]; then return 0; fi
+  else
+    sessionid=$1
+  fi
+  attached=$(tmux ls -F '#{session_attached}@#{session_name}' | grep "@${sessionid}" | sed 's/@[0-9]*//g')
+  if [ "$attached" == 1 ]; then return 1; fi
+  return 0
+}
+
+function is_attached() {
+  _is_attached "$@" 2>/dev/null
+  echo $?
+}
+
+function in_session() {
+  if [ -n "$TMUX" ]; then echo 1; else echo 0; fi
+}
+
+function exit_session() {
+  _is_attached 2>/dev/null
+  if [ $? == 1 ]; then tmux kill-session; fi
+}
+
+function current_pane() {
+  if [ -z "$TMUX_PANE" ]; then
+    echo -1
+  else
+    echo $(tmux list-panes -F "#P@#D" | grep "@$TMUX_PANE" | sed "s/@$TMUX_PANE//g")
+  fi
+}
+
+function _find_panes_by_title() {
+  if [ -z "$1" ]; then return; fi
+  echo $(tmux list-panes -F "#P:#T" | grep -E "^[0-9]+:.*?$1.*$" | sed "s/:.*//g")
+}
+
+function _clear_panes_help() {
+  print '%s\n' 'tmon clear [-a | --all] [-h | --help]' \
+               'Close all panes.' \
+               '' \
+               '  -a, --all     Remove file monitors.' \
+               '  -h, --help    Display this help and exit.' \
+               '' \
+               'Examples:' \
+               '  tmon clear -a    Close all panes and remove all file monitors.'
+               ''
+  exit
+}
+
+function clear_panes() {
+  ARGUMENTS=$(getopt -o "a,h" -l "all,help" -- "$@") || _clear_panes_help
+  eval "set -- ${ARGUMENTS}"
+  
+  args=()
+  clear_cache=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--all)
+        clear_cache=true
+        shift
+        ;;
+      -h|--help)
+        _clear_panes_help
+        ;;
+      --)
+        shift
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [ $(current_pane) != 0 ]; then tmux swap-pane -U; fi
+  tmux kill-pane -a -t 0
+  if [ $clear_cache == true ]; then _monitor_clear; fi
+}
+
+function _tmon_monitor_help() {
+  printf '%s\n' 'tmon monitor [-c | --clear] [-s | --sudo] [-h | --help] [NPANES]' \
+                '' \
+                'Open the last NPANES monitored files. Open 2 files when NPANES is not passed.' \
+                '' \
+                '  -c, --clear    Close all other panes before open.' \
+                '  -s, --sudo     Use sudo when opening files.' \
+                '  -h, --help     Display this help and exit.' \
+                '' \
+                'Examples:' \
+                '  tmon monitor -c 2    Clear current panes and open the last 2 monitored files' \
+                ''
+  exit
+}
+
+function tmon_monitor() {
+  ARGUMENTS=$(getopt -o "c,s" -l "clear,sudo" -- "$@") || _tmon_monitor_help
+  eval "set -- ${ARGUMENTS}"
+
+  args=()
+  use_sudo=false
+  clear=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c|--clear)
+        clear=true
+        shift
+        ;;
+      -s|--sudo)
+        use_sudo=true
+        shift
+        ;;
+      -h|--help)
+        _tmon_monitor_help
+        ;;
+      --)
+        shift
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+  
+  attached=$(in_session)
+  if [ $attached == 0 ]; then _start_session; fi
+  
+  if [ -z "${args[0]}" ]; then num_files=2; else num_files="${args[0]}"; fi
+  _get_monitored_files "$num_files" | while IFS= read -r file; do
+    if [ -f "$file" ]; then
+      if [ $use_sudo == true ]; then 
+        tmux split-window -v "\"$sudo\" tail -n +0 -f \"${file}\""
+      else
+        tmux split-window -v "tail -n +0 -f \"${file}\""
+      fi
+	  filename=$(basename "$file")
+      tmux select-pane -T "[ $filename ]"
+    fi
+  done
+  _set_layout
+
+  if [ $attached == 0 ]; then tmux attach; fi
+}
+
+function _tmon_open_help() {
+  printf '%s\n' 'tmon open [-c | --create] [-C | --cut NCOLS] [-s | --sudo] [-h | --help] [FILE]...' \
+                '' \
+                'Monitor files in separate tmux windows.' \
+                '' \
+                '  -c, --create    Create target files when not exist.' \
+                '  -C, --cut       Show the file with only the first NCOLS characters preserved per row.' \
+                '  -s, --sudo      Use sudo when creating and opening files.' \
+                '  -h, --help      Display this help and exit.' \
+                '' \
+                'Examples:' \
+                '  tmon open -c log.txt          Monitor log.txt with tmux. Create the file when not exist.' \
+                '  tmon open -s /var/log/syslog  Monitor /var/log/syslog with root privilege.' \
+                ''
+  exit
+}
+
+function tmon_open() {
+  ARGUMENTS=$(getopt -o "s,c,C:,h" -l "sudo,create,cut:,help" -- "$@") || _tmon_open_help
+  eval "set -- ${ARGUMENTS}"
+
+  args=()
+  use_sudo=false
+  create=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -s|--sudo)
+        use_sudo=true
+        shift
+        ;;
+      -c|--create)
+        create=true
+        shift
+        ;;
+      -C|--cut)
+        cut=$2
+        shift 2
+        ;;
+      -h|--help)
+        _tmon_open_help
+        ;;
+      --)
+        shift
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "$cut" =~ ^-?[0-9]+$ ]]; then cut=" | cut -c \"-$cut\""; else cut="" ; fi
+
+  attached=$(in_session)
+  if [ $attached == 0 ]; then _start_session; fi
+  
+  i=0
+  while (( $i < ${#args[@]} )); do
+    file=${args[$i]}
+    if [ ${create} == true -o -f ${file} ]; then
+      if [ $use_sudo == true ]; then 
+        if [ ${create} == true -a ! -e ${file} ]; then "$sudo" touch "$file"; fi
+        tmux split-window -v "\"$sudo\" tail -n +0 -f \"${file}\"${cut}"
+      else 
+        if [ ${create} == true -a ! -e ${file} ]; then touch "$file"; fi
+        tmux split-window -v "tail -n +0 -f \"${file}\"${cut}"
+      fi
+	  filename=$(basename "$file")
+      tmux select-pane -T "[ $filename ]"
+      _monitor_append $(_abspath "$file")
+    fi
+    i+=1
+  done
+  _set_layout
+
+  if [ $attached == 0 ]; then tmux attach; fi
+}
+
+function _tmon_kill_help() {
+  printf '%s\n' 'tmon kill [-n | --name] [-h | --help] [NAMES]...'
+  exit
+}
+
+function tmon_kill() {
+  ARGUMENTS=$(getopt -o "n,h" -l "name,help" -- "$@") || _tmon_kill_help
+  eval "set -- ${ARGUMENTS}"
+  args=()
+  use_name=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--name)
+        use_name=true
+    shift
+    ;;
+      -h|--help)
+        _tmon_kill_help
+    ;;
+      --)
+        shift
+    ;;
+      *)
+        args+=("$1")
+    shift
+    ;;
+    esac
+  done
+
+  for index in "${args[@]}"; do
+    if [ $use_name == true ]; then
+      for i in $(_find_panes_by_title $index); do
+        tmux kill-pane -t $i
+      done
+    else
+      tmux kill-pane -t $index
+    fi
+  done
+}
+
+function _help() {
+  printf "%s\n" "tmon [open | monitor | kill | clear | exit] [...]"
+}
+
+subparser=$1
+shift
+
+case "$subparser" in
+  -h|-help)
+    _help
+    exit
+    ;;
+  open)
+    tmon_open "$@"
+    ;;
+  monitor)
+    tmon_monitor "$@"
+    ;;
+  kill)
+    tmon_kill "$@"
+    ;;
+  clear)
+    clear_panes "$@"
+    ;;
+  exit)
+    exit_session
+    ;;
+  *)
+    _help
+    exit
+    ;;
+esac
+
