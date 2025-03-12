@@ -135,8 +135,8 @@ function _set_layout() {
   tmux select-pane -T ""
   tmux resize-pane -x 50% 2>/dev/null
   if [ $? -ne 0 ]; then
-	width=$(_get_window_width)
-	if [ -n width ]; then tmux resize-pane -x $(expr "${width}" / 2); fi
+    width=$(_get_window_width)
+    if [ -n width ]; then tmux resize-pane -x $(expr "${width}" / 2); fi
   fi
 }
 
@@ -185,10 +185,10 @@ function _get_pane_title() {
   max_title_size=$(expr $(expr "$width" / 2) - 5)
   if [ $max_title_size -gt 4 ]; then
     title=$(echo "$1" | cut -c "-$(expr $max_title_size - 4)")
-	echo "[ $title ]"
+    echo "[ $title ]"
   else
     title=$(echo "$1" | cut -c "-$max_title_size")
-	echo "$title"
+    echo "$title"
   fi
 }
 
@@ -298,6 +298,7 @@ function tmon_monitor() {
       if [ $use_sudo == true ]; then 
         tmux split-window -v "\"$sudo\" tail -n +0 -f \"${file}\""
       else
+        if [ ! -r "$file" ]; then continue; fi
         tmux split-window -v "tail -n +0 -f \"${file}\""
       fi
       tmux select-pane -T "$(_get_pane_title "$title")"
@@ -309,22 +310,25 @@ function tmon_monitor() {
 }
 
 function _tmon_exec_help() {
-  printf '%s\n' 'tmon exec [-o] [-e] [--stdout FILE] [--stderr FILE] [-s | --sudo] [-h | --help]' \
-                '          [-t | --title TITLE] [-a | --append] ARGS...' \
+  printf '%s\n' 'tmon exec [-o] [-e] [--stdout FILE] [--stderr FILE] [-s | --sudo] [-d | --detach]' \
+                '          [-t | --title TITLE] [-a | --append] [-h | --help] ARGS...' \
                 '' \
-                'Execute command and show output in separate tmux windows.' \
+                'Execute command and show output in separate tmux panes.' \
                 '' \
-                '  -o               Show stdout in a tmux window.' \
-                '  -e               Show stderr in a tmux window.' \
+                '  -o               Show stdout in a tmux pane.' \
+                '  -e               Show stderr in a tmux pane.' \
                 '  -s, --sudo       Use sudo when creating and opening files.' \
                 '  -t, --title      Overwrite pane title with specified content.' \
                 '  -a, --append     Record stdout and stderr with appending mode.' \
+                '  -d, --detach     Monitor the process but do not open panes.' \
                 '  --stdout FILE    Record stdout to FILE. Use temporary file when not specified.' \
                 '  --stderr FILE    Record stderr to FILE. Use temporary file when not specified.' \
                 '  -h, --help       Display this help and exit.' \
                 '' \
                 'Examples:' \
                 '  tmon exec -e command    Execute command and show stderr.' \
+                '  tmon exec -o --stdout /tmp/stdout.log -a -d command' \
+                '      Execute command and append output to /tmp/stdout.log without opening an extra pane.' \
                 ''
   exit
 }
@@ -332,6 +336,7 @@ function _tmon_exec_help() {
 function tmon_exec() {
   args=()
   use_sudo=false
+  detached=false
   stdout_file=
   stderr_file=
   log_stdout=false
@@ -343,6 +348,10 @@ function tmon_exec() {
     case "$1" in
       -s|--sudo)
         use_sudo=true
+        shift
+        ;;
+      -d|--detach)
+        detached=true
         shift
         ;;
       -t|--title)
@@ -411,42 +420,51 @@ function tmon_exec() {
   "${args[@]}" >/dev/null 2>/dev/null &
   pid=$!
 
-  attached=$(in_session)
-  if [ $attached == 0 ]; then _start_session; fi  
+  if [ ! "$detached" == true ]; then
+    attached=$(in_session)
+    if [ $attached == 0 ]; then _start_session; fi  
+  fi
 
   if [ "$log_stderr" == true ]; then
     touch "$stderr_file"
-    tmux split-window -v "tail -n +0 -f \"${stderr_file}\""
     if [ "$overwrite_title" == true ]; then title="stderr ${_title}"; else title="stderr $args_string"; fi
-    tmux select-pane -T "$(_get_pane_title "$title")"
-	abspath=$(_abspath "$stderr_file")
+    if [ ! "$detached" == true ]; then
+      tmux split-window -v "tail -n +0 -f \"${stderr_file}\""
+      tmux select-pane -T "$(_get_pane_title "$title")"
+    fi
+    abspath=$(_abspath "$stderr_file")
     _monitor_append "$abspath" "$title" "$pid" "$tmp_index"
   fi
 
   if [ "$log_stdout" == true ]; then
     touch "$stdout_file"
-    tmux split-window -v "tail -n +0 -f \"${stdout_file}\""
     if [ "$overwrite_title" == true ]; then title="stdout ${_title}"; else title="stdout $args_string"; fi
-    tmux select-pane -T "$(_get_pane_title "$title")"
-	abspath=$(_abspath "$stdout_file")
+    if [ ! "$detached" == true ]; then
+      tmux split-window -v "tail -n +0 -f \"${stdout_file}\""
+      tmux select-pane -T "$(_get_pane_title "$title")"
+    fi
+    abspath=$(_abspath "$stdout_file")
     _monitor_append "$abspath" "$title" "$pid" "$tmp_index"
   fi
   
   _monitor_file_check
-  _set_layout
-
-  if [ $attached == 0 ]; then tmux attach; fi
+  
+  if [ ! "$detached" == true ]; then
+    _set_layout
+    if [ $attached == 0 ]; then tmux attach; fi
+  fi
 }
 
 function _tmon_open_help() {
   printf '%s\n' 'tmon open [-c | --create] [-C | --cut NCOLS] [-s | --sudo] [-f | --full] ' \
-                '          [-t | --title TITLE] [-h | --help] [FILE]...' \
+                '          [-t | --title TITLE] [-d | --detach] [-h | --help] [FILE]...' \
                 '' \
                 'Monitor files in separate tmux windows.' \
                 '' \
                 '  -c, --create    Create target files when not exist.' \
                 '  -C, --cut       Show the file with only the first NCOLS characters preserved per row.' \
                 '  -s, --sudo      Use sudo when creating and opening files.' \
+                '  -d, --detach    Monitor the file but do not open a pane.' \
                 '  -f, --full      Show absolute path on pane title.' \
                 '  -t, --title     Overwrite pane title with specified content.' \
                 '  -h, --help      Display this help and exit.' \
@@ -459,11 +477,12 @@ function _tmon_open_help() {
 }
 
 function tmon_open() {
-  ARGUMENTS=$(getopt -o "s,c,C:,f,t:,h" -l "sudo,create,cut:,full,title:,help" -- "$@") || _tmon_open_help
+  ARGUMENTS=$(getopt -o "s,c,C:,f,t:,d,h" -l "sudo,create,cut:,full,title:,detach,help" -- "$@") || _tmon_open_help
   eval "set -- ${ARGUMENTS}"
 
   args=()
   use_sudo=false
+  detached=false
   absolute_path=false
   create=false
   overwrite_title=false
@@ -472,6 +491,10 @@ function tmon_open() {
     case "$1" in
       -s|--sudo)
         use_sudo=true
+        shift
+        ;;
+      -d|--detach)
+        detached=true
         shift
         ;;
       -c|--create)
@@ -506,33 +529,37 @@ function tmon_open() {
 
   if expr "$cut" : '^[0-9]\+$' >/dev/null; then cut=" | cut -c \"-$cut\""; else cut="" ; fi
 
-  attached=$(in_session)
-  if [ $attached == 0 ]; then _start_session; fi
+  if [ ! "$detached" == true ]; then
+    attached=$(in_session)
+    if [ $attached == 0 ]; then _start_session; fi
+  fi
   
   i=0
   while [ $i -lt ${#args[@]} ]; do
     file=${args[$i]}
     if [ ${create} == true -o -f ${file} ]; then
+      abspath=$(_abspath "$file")
       if [ $use_sudo == true ]; then 
         if [ ${create} == true -a ! -e ${file} ]; then "$sudo" touch "$file"; fi
-        tmux split-window -v "\"$sudo\" tail -n +0 -f \"${file}\"${cut}"
-      else 
+        if [ ! "$detached" == true ]; then tmux split-window -v "\"$sudo\" tail -n +0 -f \"${file}\"${cut}"; fi
+      else
         if [ ${create} == true -a ! -e ${file} ]; then touch "$file"; fi
-        tmux split-window -v "tail -n +0 -f \"${file}\"${cut}"
+        if [ ! "$detached" == true ]; then tmux split-window -v "tail -n +0 -f \"${file}\"${cut}"; fi
       fi
-      abspath=$(_abspath "$file")
       if [ ${overwrite_title} == false ]; then
         if [ ${absolute_path} == true ]; then title="$abspath"; else title=$(basename "$file"); fi
       fi
-      tmux select-pane -T "$(_get_pane_title "$title")"
+      if [ ! "$detached" == true ]; then tmux select-pane -T "$(_get_pane_title "$title")"; fi
       _monitor_append "$abspath" "$title"
     fi
     i=$(expr $i + 1)
   done
   _monitor_file_check
-  _set_layout
-
-  if [ $attached == 0 ]; then tmux attach; fi
+  
+  if [ ! "$detached" == true ]; then
+    _set_layout
+    if [ $attached == 0 ]; then tmux attach; fi
+  fi
 }
 
 function _tmon_kill_help() {
