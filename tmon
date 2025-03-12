@@ -510,7 +510,7 @@ function tmon_open() {
   if [ $attached == 0 ]; then _start_session; fi
   
   i=0
-  while [ $i < ${#args[@]} ]; do
+  while [ $i -lt ${#args[@]} ]; do
     file=${args[$i]}
     if [ ${create} == true -o -f ${file} ]; then
       if [ $use_sudo == true ]; then 
