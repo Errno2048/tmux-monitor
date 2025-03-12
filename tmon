@@ -241,10 +241,10 @@ function tmon_ps() {
       echo "Index|File|Title|PID"
       _get_monitored_files | while IFS= read -r line || [ -n "$line" ]; do
         IFS="|" read -r file title pid tmp <<< "$line"
-        if [ -z $tmp ]; then tmp=" "; fi
-        if [ -z $file ]; then file=" "; fi
-        if [ -z $title ]; then title=" "; fi
-        if [ -z $pid ]; then pid=" "; fi
+        if [ -z "$tmp" ]; then tmp=" "; fi
+        if [ -z "$file" ]; then file=" "; fi
+        if [ -z "$title" ]; then title=" "; fi
+        if [ -z "$pid" ]; then pid=" "; fi
         echo "$tmp|$file|$title|$pid"
       done
     } | column -t -s "|"
