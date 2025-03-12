@@ -382,7 +382,7 @@ function tmon_exec() {
   else
     args=(nohup sh -c "${args[*]} ${redirect}")
   fi
-  "${args[@]}" &
+  "${args[@]}" >/dev/null 2>/dev/null &
   pid=$!
 
   attached=$(in_session)
