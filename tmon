@@ -105,14 +105,19 @@ function _get_tmp_stderr() {
 
 function _get_tmp_index() {
   _prepare_tmp
-  init_index=$RANDOM
-  tmp_index=$(expr $(expr $init_index + 1) % 32768 )
-  while [ $tmp_index != $init_index ]; do
-    if [ ! -e $(_get_tmp_stdout "$tmp_index") -a ! -e $(_get_tmp_stderr "$tmp_index") ]; then
-      echo "$tmp_index"
-      return
-    fi
-    tmp_index=$(expr $(expr $tmp_index + 1) % 32768)
+  loop_times=0
+  while [ $loop_times -lt 32768 ]; do
+    base_index=$(expr $loop_times \* 32768)
+    init_index=$RANDOM
+    tmp_index=$(expr $(expr $(expr $init_index + 1) % 32768) + $base_index)
+    while [ ! $tmp_index == $init_index ]; do
+      if [ ! -e $(_get_tmp_stdout "$tmp_index") -a ! -e $(_get_tmp_stderr "$tmp_index") ]; then
+        echo "$tmp_index"
+        return
+      fi
+      tmp_index=$(expr $(expr $tmp_index + 1) % 32768)
+    done
+    loop_times=$(expr $loop_times + 1)
   done
   echo ""; return
 }
@@ -192,7 +197,61 @@ function _get_pane_title() {
   fi
 }
 
-function _clear_panes_help() {
+function _tmon_ps_help() {
+  print '%s\n' 'tmon ps [--raw] [-h | --help]' \
+               'List all monitored files.' \
+               '' \
+               '  -h, --help    Display this help and exit.' \
+               '      --raw     Show raw information.' \
+               ''
+  exit
+}
+
+function tmon_ps() {
+  ARGUMENTS=$(getopt -o "h" -l "raw,help" -- "$@" 2>/dev/null) || _tmon_ps_help
+  eval "set -- ${ARGUMENTS}"
+  
+  args=()
+  raw_info=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --raw)
+        raw_info=true
+        shift
+        ;;
+      -h|--help)
+        _tmon_ps_help
+        ;;
+      --)
+        shift
+        ;;
+      *)
+        _tmon_ps_help
+        ;;
+    esac
+  done
+  
+  if [ "$raw_info" == true ]; then
+    _get_monitored_files | while IFS= read -r line || [ -n "$line" ]; do
+      IFS="|" read -r file title pid tmp <<< "$line"
+      echo "$tmp|$file|$title|$pid"
+    done
+  else
+    {
+      echo "Index|File|Title|PID"
+      _get_monitored_files | while IFS= read -r line || [ -n "$line" ]; do
+        IFS="|" read -r file title pid tmp <<< "$line"
+        if [ -z $tmp ]; then tmp=" "; fi
+        if [ -z $file ]; then file=" "; fi
+        if [ -z $title ]; then title=" "; fi
+        if [ -z $pid ]; then pid=" "; fi
+        echo "$tmp|$file|$title|$pid"
+      done
+    } | column -t -s "|"
+  fi
+}
+
+function _clear_help() {
   print '%s\n' 'tmon clear [-a | --all] [-h | --help]' \
                'Close all panes.' \
                '' \
@@ -205,8 +264,8 @@ function _clear_panes_help() {
   exit
 }
 
-function clear_panes() {
-  ARGUMENTS=$(getopt -o "a,h" -l "all,help" -- "$@") || _clear_panes_help
+function tmon_clear() {
+  ARGUMENTS=$(getopt -o "a,h" -l "all,help" -- "$@" 2>/dev/null) || _clear_help
   eval "set -- ${ARGUMENTS}"
   
   args=()
@@ -218,7 +277,7 @@ function clear_panes() {
         shift
         ;;
       -h|--help)
-        _clear_panes_help
+        _clear_help
         ;;
       --)
         shift
@@ -251,7 +310,7 @@ function _tmon_monitor_help() {
 }
 
 function tmon_monitor() {
-  ARGUMENTS=$(getopt -o "c,s" -l "clear,sudo" -- "$@") || _tmon_monitor_help
+  ARGUMENTS=$(getopt -o "c,s,h" -l "clear,sudo,help" -- "$@" 2>/dev/null) || _tmon_monitor_help
   eval "set -- ${ARGUMENTS}"
 
   args=()
@@ -315,15 +374,15 @@ function _tmon_exec_help() {
                 '' \
                 'Execute command and show output in separate tmux panes.' \
                 '' \
-                '  -o               Show stdout in a tmux pane.' \
-                '  -e               Show stderr in a tmux pane.' \
-                '  -s, --sudo       Use sudo when creating and opening files.' \
-                '  -t, --title      Overwrite pane title with specified content.' \
-                '  -a, --append     Record stdout and stderr with appending mode.' \
-                '  -d, --detach     Monitor the process but do not open panes.' \
-                '  --stdout FILE    Record stdout to FILE. Use temporary file when not specified.' \
-                '  --stderr FILE    Record stderr to FILE. Use temporary file when not specified.' \
-                '  -h, --help       Display this help and exit.' \
+                '  -o                   Show stdout in a tmux pane.' \
+                '  -e                   Show stderr in a tmux pane.' \
+                '  -s, --sudo           Use sudo when creating and opening files.' \
+                '  -t, --title          Overwrite pane title with specified content.' \
+                '  -a, --append         Record stdout and stderr with appending mode.' \
+                '  -d, --detach         Monitor the process but do not open panes.' \
+                '      --stdout FILE    Record stdout to FILE. Use temporary file when not specified.' \
+                '      --stderr FILE    Record stderr to FILE. Use temporary file when not specified.' \
+                '  -h, --help           Display this help and exit.' \
                 '' \
                 'Examples:' \
                 '  tmon exec -e command    Execute command and show stderr.' \
@@ -394,9 +453,11 @@ function tmon_exec() {
   
   if [ "${#args[@]}" == 0 ]; then _tmon_exec_help; fi
   
-  tmp_index=
+  tmp_index=$(_get_tmp_index)
+  if [ -n "$tmp_index" ]; then
+    touch $(_get_tmp_stdout "$tmp_index")
+  fi
   if [ -z "$stdout_file" -o -z "$stderr_file" ]; then
-    tmp_index=$(_get_tmp_index)
     if [ -z "$tmp_index" ]; then
       if [ -z "$stdout_file" ]; then stdout_file=nohup.out; fi
       if [ -z "$stderr_file" ]; then stderr_file=nohup.err; fi
@@ -477,7 +538,7 @@ function _tmon_open_help() {
 }
 
 function tmon_open() {
-  ARGUMENTS=$(getopt -o "s,c,C:,f,t:,d,h" -l "sudo,create,cut:,full,title:,detach,help" -- "$@") || _tmon_open_help
+  ARGUMENTS=$(getopt -o "s,c,C:,f,t:,d,h" -l "sudo,create,cut:,full,title:,detach,help" -- "$@" 2>/dev/null) || _tmon_open_help
   eval "set -- ${ARGUMENTS}"
 
   args=()
@@ -550,7 +611,12 @@ function tmon_open() {
         if [ ${absolute_path} == true ]; then title="$abspath"; else title=$(basename "$file"); fi
       fi
       if [ ! "$detached" == true ]; then tmux select-pane -T "$(_get_pane_title "$title")"; fi
-      _monitor_append "$abspath" "$title"
+      tmp_index=$(_get_tmp_index)
+      if [ -n "$tmp_index" ]; then
+        dummy_stdout_file=$(_get_tmp_stdout "$tmp_index")
+        touch "$dummy_stdout_file"
+      fi
+      _monitor_append "$abspath" "$title" "" "$tmp_index"
     fi
     i=$(expr $i + 1)
   done
@@ -563,47 +629,127 @@ function tmon_open() {
 }
 
 function _tmon_kill_help() {
-  printf '%s\n' 'tmon kill [-n | --name] [-h | --help] [NAMES]...'
+  printf '%s\n' 'tmon kill [-t | --title] [-f | --file] [-p | --pid] [-h | --help]' \
+                '          [--full-match] [-r | --regex] [-c | --close] [NAMES]...' \
+                '' \
+                'Remove file monitors. By default, remove monitors by temporary file ID.' \
+                '' \
+                '  -t, --title         Remove monitors by pane title.' \
+                '  -f, --file          Remove monitors by file path.' \
+                '      --full-match    When passed, only fully matched files (or titles) will be removed.' \
+                '  -r, --regex         Use regular expression matching.' \
+                '  -p, --pid           Remove monitors by PID.' \
+                '  -h, --help          Display this help and exit.' \
+                '' \
+                'Examples:' \
+                '  tmon kill 10          Remove monitor of temporary file 10.' \
+                '  tmon kill -t TITLE    Remove monitor with title TITLE.' \
+                ''
   exit
 }
 
 function tmon_kill() {
-  ARGUMENTS=$(getopt -o "n,h" -l "name,help" -- "$@") || _tmon_kill_help
+  ARGUMENTS=$(getopt -o "t,f,p,h" -l "title,file,pid,help,full-match" -- "$@" 2>/dev/null) || _tmon_kill_help
   eval "set -- ${ARGUMENTS}"
+
   args=()
   use_name=false
+  use_path=false
+  use_pid=false
+  regex=false
+  full_match=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -n|--name)
+      -t|--title)
         use_name=true
-    shift
-    ;;
+        shift
+        ;;
+      -f|--file)
+        use_path=true
+        shift
+        ;;
+      -p|--pid)
+        use_pid=true
+        shift
+        ;;
+      --full-match)
+        full_match=true
+        shift
+        ;;
+      -r|--regex)
+        regex=true
+        shift
+        ;;
       -h|--help)
         _tmon_kill_help
-    ;;
+        ;;
       --)
         shift
-    ;;
+        ;;
       *)
         args+=("$1")
-    shift
-    ;;
+        shift
+        ;;
     esac
   done
 
-  for index in "${args[@]}"; do
-    if [ $use_name == true ]; then
-      for i in $(_find_panes_by_title $index); do
-        tmux kill-pane -t $i
+  _prepare_tmp
+  monitor_file=$(_get_monitor_file)
+  monitor_tmpfile="${monitor_file}.tmp"
+  if [ ! -f "$monitor_file" ]; then
+    if [ -f "$monitor_tmpfile" ]; then mv "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+  else
+    if [ -f "$monitor_tmpfile" ]; then rm -f "$monitor_tmpfile"; fi
+  fi
+  (cat "$monitor_file"; echo) | while IFS= read -r line; do
+    if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
+    IFS="|" read -r file title pid tmp <<< "$line"
+    matched=false
+    if [ $use_name == true -o $use_path == true ]; then
+      if [ $use_name == true ]; then target=$title; else target=$file; fi
+      for value in "${args[@]}"; do
+        if [ $full_match == true ]; then
+          if [ $regex == true ]; then
+            if [ -n $(echo "$target" | grep -E -x "$value") ]; then matched=true; break; fi
+          else
+            if [ "$target" == "$value" ]; then matched=true; break; fi
+          fi
+        else
+          if [ $regex == true ]; then
+            if [ -n $(echo "$target" | grep -E "$value") ]; then matched=true; break; fi
+          else
+            if expr "$target" : ".*$value" >/dev/null; then matched=true; break; fi
+          fi
+        fi
       done
     else
-      tmux kill-pane -t $index
+      if [ $use_pid == true ]; then target=$pid; else target=$tmp; fi
+      if [ -n "$target" ]; then
+        for value in "${args[@]}"; do
+          if [ "$target" == "$value" ]; then matched=true; break; fi
+        done
+      fi
+    fi
+    if [ $matched == true ]; then
+      if [ -n "$tmp" ]; then
+        echo "Killed $tmp"
+        tmp_stdout=$(_get_tmp_stdout "$tmp")
+        if [ -f "$tmp_stdout" ]; then rm -f "$tmp_stdout"; fi
+        tmp_stderr=$(_get_tmp_stderr "$tmp")
+        if [ -f "$tmp_stderr" ]; then rm -f "$tmp_stderr"; fi
+      else
+        echo "Killed"
+      fi
+    else
+      echo "$line" >> "$monitor_tmpfile"
     fi
   done
+  if [ -f "$monitor_file" ]; then rm -f "$monitor_file"; fi
+  if [ -f "$monitor_tmpfile" ]; then mv "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
 }
 
 function _help() {
-  printf "%s\n" "tmon [open | exec | monitor | kill | clear | exit] [...]"
+  printf "%s\n" "tmon [ps | open | exec | monitor | kill | clear | exit] [...]"
 }
 
 subparser=$1
@@ -613,6 +759,9 @@ case "$subparser" in
   -h|-help)
     _help
     exit
+    ;;
+  ps)
+    tmon_ps "$@"
     ;;
   open)
     tmon_open "$@"
@@ -627,7 +776,7 @@ case "$subparser" in
     tmon_kill "$@"
     ;;
   clear)
-    clear_panes "$@"
+    tmon_clear "$@"
     ;;
   exit)
     exit_session
