@@ -630,8 +630,8 @@ function tmon_open() {
 }
 
 function _tmon_kill_help() {
-  printf '%s\n' 'tmon kill [-t | --title] [-f | --file] [-p | --pid] [-h | --help]' \
-                '          [--full-match] [-r | --regex] [-c | --close] [NAMES]...' \
+  printf '%s\n' 'tmon kill [-t | --title] [-f | --file] [-p | --pid] [-P | --process] [-s | --sudo]' \
+                '          [--full-match] [-r | --regex] [-h | --help] [NAMES]...' \
                 '' \
                 'Remove file monitors. By default, remove monitors by temporary file ID.' \
                 '' \
@@ -640,6 +640,8 @@ function _tmon_kill_help() {
                 '      --full-match    When passed, only fully matched files (or titles) will be removed.' \
                 '  -r, --regex         Use regular expression matching.' \
                 '  -p, --pid           Remove monitors by PID.' \
+                '  -P, --process       Kill the corresponding processes.' \
+                '  -s, --sudo          Use sudo when killing processes.' \
                 '  -h, --help          Display this help and exit.' \
                 '' \
                 'Examples:' \
@@ -650,13 +652,15 @@ function _tmon_kill_help() {
 }
 
 function tmon_kill() {
-  ARGUMENTS=$(getopt -o "t,f,p,h" -l "title,file,pid,help,full-match" -- "$@" 2>/dev/null) || _tmon_kill_help
+  ARGUMENTS=$(getopt -o "t,f,p,P,s,h" -l "title,file,pid,process,sudo,help,full-match" -- "$@" 2>/dev/null) || _tmon_kill_help
   eval "set -- ${ARGUMENTS}"
 
   args=()
+  use_sudo=false
   use_name=false
   use_path=false
   use_pid=false
+  kill=false
   regex=false
   full_match=false
   while [[ $# -gt 0 ]]; do
@@ -679,6 +683,14 @@ function tmon_kill() {
         ;;
       -r|--regex)
         regex=true
+        shift
+        ;;
+      -P|--process)
+        kill=true
+        shift
+        ;;
+      -s|--sudo)
+        use_sudo=true
         shift
         ;;
       -h|--help)
@@ -732,6 +744,13 @@ function tmon_kill() {
       fi
     fi
     if [ $matched == true ]; then
+	  if [ -n "$pid" ]; then
+	    if [ $use_sudo == true ]; then
+	      "$sudo" kill "$pid" >/dev/null 2>/dev/null
+		else
+	      kill "$pid" >/dev/null 2>/dev/null
+		fi
+	  fi
       if [ -n "$tmp" ]; then
         echo "Killed $tmp"
         tmp_stdout=$(_get_tmp_stdout "$tmp")
