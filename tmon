@@ -122,6 +122,11 @@ function _start_session() {
   tmux set status-style "bg=black,fg=green"
   tmux set pane-border-format "#{pane_title}"
   tmux set pane-border-status top
+  tmux set mouse on
+}
+
+function _get_window_width() {
+  echo $(tmux display-message -p "#{window_width}" 2>/dev/null)
 }
 
 function _set_layout() {
@@ -130,7 +135,7 @@ function _set_layout() {
   tmux select-pane -T ""
   tmux resize-pane -x 50% 2>/dev/null
   if [ $? -ne 0 ]; then
-	width=$(tmux display-message -p "#{window_width}" 2>/dev/null)
+	width=$(_get_window_width)
 	if [ -n width ]; then tmux resize-pane -x $(expr "${width}" / 2); fi
   fi
 }
@@ -172,6 +177,19 @@ function current_pane() {
 function _find_panes_by_title() {
   if [ -z "$1" ]; then return; fi
   echo $(tmux list-panes -F "#P:#T" | grep -E "^[0-9]+:.*?$1.*$" | sed "s/:.*//g")
+}
+
+function _get_pane_title() {
+  if [ -z "$1" ]; then echo ""; return; fi
+  width=$(_get_window_width)
+  max_title_size=$(expr $(expr "$width" / 2) - 5)
+  if [ $max_title_size -gt 4 ]; then
+    title=$(echo "$1" | cut -c "-$(expr $max_title_size - 4)")
+	echo "[ $title ]"
+  else
+    title=$(echo "$1" | cut -c "-$max_title_size")
+	echo "$title"
+  fi
 }
 
 function _clear_panes_help() {
@@ -282,7 +300,7 @@ function tmon_monitor() {
       else
         tmux split-window -v "tail -n +0 -f \"${file}\""
       fi
-      tmux select-pane -T "[ $title ]"
+      tmux select-pane -T "$(_get_pane_title "$title")"
     fi
   done
   _set_layout
@@ -320,7 +338,7 @@ function tmon_exec() {
   log_stderr=false
   overwrite_title=false
   append=false
-  title=
+  _title=
   while [ $# -gt 0 ]; do
     case "$1" in
       -s|--sudo)
@@ -329,7 +347,7 @@ function tmon_exec() {
         ;;
       -t|--title)
         overwrite_title=true
-        title=$2
+        _title=$2
         shift 2
         ;;
       -h|--help)
@@ -399,8 +417,8 @@ function tmon_exec() {
   if [ "$log_stderr" == true ]; then
     touch "$stderr_file"
     tmux split-window -v "tail -n +0 -f \"${stderr_file}\""
-    if [ "$overwrite_title" == true ]; then :; else title="stderr $args_string"; fi
-    if [ -n "$title" ]; then tmux select-pane -T "[ $title ]"; else tmux select-pane -T ""; fi
+    if [ "$overwrite_title" == true ]; then title="stderr ${_title}"; else title="stderr $args_string"; fi
+    tmux select-pane -T "$(_get_pane_title "$title")"
 	abspath=$(_abspath "$stderr_file")
     _monitor_append "$abspath" "$title" "$pid" "$tmp_index"
   fi
@@ -408,8 +426,8 @@ function tmon_exec() {
   if [ "$log_stdout" == true ]; then
     touch "$stdout_file"
     tmux split-window -v "tail -n +0 -f \"${stdout_file}\""
-    if [ "$overwrite_title" == true ]; then :; else title="stdout $args_string"; fi
-    if [ -n "$title" ]; then tmux select-pane -T "[ $title ]"; else tmux select-pane -T ""; fi
+    if [ "$overwrite_title" == true ]; then title="stdout ${_title}"; else title="stdout $args_string"; fi
+    tmux select-pane -T "$(_get_pane_title "$title")"
 	abspath=$(_abspath "$stdout_file")
     _monitor_append "$abspath" "$title" "$pid" "$tmp_index"
   fi
@@ -492,7 +510,7 @@ function tmon_open() {
   if [ $attached == 0 ]; then _start_session; fi
   
   i=0
-  while (( $i < ${#args[@]} )); do
+  while [ $i < ${#args[@]} ]; do
     file=${args[$i]}
     if [ ${create} == true -o -f ${file} ]; then
       if [ $use_sudo == true ]; then 
@@ -506,7 +524,7 @@ function tmon_open() {
       if [ ${overwrite_title} == false ]; then
         if [ ${absolute_path} == true ]; then title="$abspath"; else title=$(basename "$file"); fi
       fi
-      if [ -n "$title" ]; then tmux select-pane -T "[ $title ]"; else tmux select-pane -T ""; fi
+      tmux select-pane -T "$(_get_pane_title "$title")"
       _monitor_append "$abspath" "$title"
     fi
     i=$(expr $i + 1)
