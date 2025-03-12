@@ -480,6 +480,7 @@ function tmon_exec() {
   fi
   "${args[@]}" >/dev/null 2>/dev/null &
   pid=$!
+  pid=$(pgrep -P "$pid" || echo "$pid")
 
   if [ ! "$detached" == true ]; then
     attached=$(in_session)
