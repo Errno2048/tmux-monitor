@@ -744,13 +744,13 @@ function tmon_kill() {
       fi
     fi
     if [ $matched == true ]; then
-	  if [ -n "$pid" ]; then
-	    if [ $use_sudo == true ]; then
-	      "$sudo" kill "$pid" >/dev/null 2>/dev/null
-		else
-	      kill "$pid" >/dev/null 2>/dev/null
-		fi
-	  fi
+      if [ -n "$pid" ]; then
+        if [ $use_sudo == true ]; then
+          "$sudo" kill "$pid" >/dev/null 2>/dev/null
+        else
+          kill "$pid" >/dev/null 2>/dev/null
+        fi
+      fi
       if [ -n "$tmp" ]; then
         echo "Killed $tmp"
         tmp_stdout=$(_get_tmp_stdout "$tmp")
