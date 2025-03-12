@@ -70,8 +70,9 @@ function _monitor_append() {
 }
 
 function _monitor_clear() {
-  monitor_file=$(_get_monitor_file)
-  if [ -f "$monitor_file" ]; then rm -f "$monitor_file"; fi
+  if [ -d "$tmp_path" ]; then
+    rm -r "$tmp_path"
+  fi
 }
 
 function _get_monitored_files() {
@@ -253,6 +254,11 @@ function tmon_monitor() {
     esac
   done
   
+  if [ "$clear" == true ]; then
+    if [ $(current_pane) != 0 ]; then tmux swap-pane -U; fi
+    tmux kill-pane -a -t 0
+  fi
+  
   attached=$(in_session)
   if [ $attached == 0 ]; then _start_session; fi
   
@@ -386,14 +392,16 @@ function tmon_exec() {
     tmux split-window -v "tail -n +0 -f \"${stderr_file}\""
     if [ "$overwrite_title" == true ]; then :; else title="stderr $args_string"; fi
     if [ -n "$title" ]; then tmux select-pane -T "[ $title ]"; else tmux select-pane -T ""; fi
-    _monitor_append "$stderr_file" "$title" "$pid" "$tmp_index"
+	abspath=$(_abspath "$stderr_file")
+    _monitor_append "$abspath" "$title" "$pid" "$tmp_index"
   fi
 
   if [ "$log_stdout" == true ]; then
     tmux split-window -v "tail -n +0 -f \"${stdout_file}\""
     if [ "$overwrite_title" == true ]; then :; else title="stdout $args_string"; fi
     if [ -n "$title" ]; then tmux select-pane -T "[ $title ]"; else tmux select-pane -T ""; fi
-    _monitor_append "$stdout_file" "$title" "$pid" "$tmp_index"
+	abspath=$(_abspath "$stdout_file")
+    _monitor_append "$abspath" "$title" "$pid" "$tmp_index"
   fi
   
   _monitor_file_check
