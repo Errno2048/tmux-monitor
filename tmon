@@ -198,12 +198,12 @@ function _get_pane_title() {
 }
 
 function _tmon_ps_help() {
-  print '%s\n' 'tmon ps [--raw] [-h | --help]' \
-               'List all monitored files.' \
-               '' \
-               '  -h, --help    Display this help and exit.' \
-               '      --raw     Show raw information.' \
-               ''
+  printf '%s\n' 'tmon ps [--raw] [-h | --help]' \
+                'List all monitored files.' \
+                '' \
+                '  -h, --help    Display this help and exit.' \
+                '      --raw     Show raw information.' \
+                ''
   exit
 }
 
@@ -252,15 +252,15 @@ function tmon_ps() {
 }
 
 function _clear_help() {
-  print '%s\n' 'tmon clear [-a | --all] [-h | --help]' \
-               'Close all panes.' \
-               '' \
-               '  -a, --all     Remove file monitors.' \
-               '  -h, --help    Display this help and exit.' \
-               '' \
-               'Examples:' \
-               '  tmon clear -a    Close all panes and remove all file monitors.'
-               ''
+  printf '%s\n' 'tmon clear [-a | --all] [-h | --help]' \
+                'Close all panes.' \
+                '' \
+                '  -a, --all     Remove file monitors.' \
+                '  -h, --help    Display this help and exit.' \
+                '' \
+                'Examples:' \
+                '  tmon clear -a    Close all panes and remove all file monitors.'
+                ''
   exit
 }
 
