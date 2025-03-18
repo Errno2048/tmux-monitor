@@ -42,11 +42,10 @@ function _monitor_file_check() {
     if [ -f "$monitor_tmpfile" ]; then rm -f "$monitor_tmpfile"; fi
   fi
   num_lines=0
-  (cat "$monitor_file"; echo) | while IFS= read -r line; do
+  while IFS= read -r line; do
     if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
     line_array=()
-    IFS="|" read -r -a line_array <<< "$line"
-    pid="${line_array[2]}"
+    IFS="|" read -r file title pid tmp dead <<< "$line"
     if [ -z "$pid" ]; then
       echo "$line" >> "$monitor_tmpfile"
       num_lines=$(expr $num_lines + 1)
@@ -55,16 +54,15 @@ function _monitor_file_check() {
         echo "$line" >> "$monitor_tmpfile"
         num_lines=$(expr $num_lines + 1)
       else
-        temp_index="${line_array[3]}"
-        if [ -n "$temp_index" ]; then
-          tmp_stdout=$(_get_tmp_stdout "$temp_index")
+        if [ -n "$tmp" ]; then
+          tmp_stdout=$(_get_tmp_stdout "$tmp")
           if [ -f "$tmp_stdout" ]; then rm -f "$tmp_stdout"; fi
-          tmp_stderr=$(_get_tmp_stderr "$temp_index")
+          tmp_stderr=$(_get_tmp_stderr "$tmp")
           if [ -f "$tmp_stderr" ]; then rm -f "$tmp_stderr"; fi
         fi
       fi
     fi
-  done
+  done < <(cat "$monitor_file"; echo)
   if [ -f "$monitor_file" ]; then rm -f "$monitor_file"; fi
   if [ -f "$monitor_tmpfile" ]; then mv "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
 }
@@ -78,8 +76,42 @@ function _monitor_append() {
 }
 
 function _monitor_clear() {
-  if [ -d "$tmp_path" ]; then
-    rm -r "$tmp_path"
+  monitor_file=$(_get_monitor_file)
+  if [ ! -f "$monitor_file" ]; then
+    if [ -d "$tmp_path" ]; then
+      rm -r "$tmp_path"
+    fi
+  else
+    preserved=()
+    preserved_tmp=()
+    while IFS= read -r line; do
+      if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
+      line_array=()
+      IFS="|" read -r file title pid tmp dead <<< "$line"
+      if [ -n "$pid" ]; then
+        if kill -0 "$pid" 2>/dev/null; then
+          preserved=("${preserved[@]}" "$file|$title|$pid|$tmp|dead")
+          preserved_tmp=("${preserved_tmp[@]}" "$(basename "$(_get_tmp_stdout $tmp)")" "$(basename "$(_get_tmp_stderr $tmp)")")
+        fi
+      fi
+    done < <(cat "$monitor_file"; echo)
+    find "$tmp_path" -mindepth 1 -maxdepth 1 | while read -r file; do
+      if [ -d "$file" ]; then
+        rm -rf "$file"
+      else
+        file_base="$(basename "$file")"
+        found=false
+        for preserved_file in "${preserved_tmp[@]}"; do
+          if [ "$file_base" == "$preserved_file" ]; then found=true; break; fi
+        done
+        if [ "$found" == true ]; then :; else
+          rm -f "$file"
+        fi
+      fi
+    done
+    for line in "${preserved[@]}"; do
+      echo "$line" >> "$monitor_file"
+    done
   fi
 }
 
@@ -233,19 +265,20 @@ function tmon_ps() {
   
   if [ "$raw_info" == true ]; then
     _get_monitored_files | while IFS= read -r line || [ -n "$line" ]; do
-      IFS="|" read -r file title pid tmp <<< "$line"
-      echo "$tmp|$file|$title|$pid"
+      IFS="|" read -r file title pid tmp dead <<< "$line"
+      echo "$tmp|$file|$title|$pid|$dead"
     done
   else
     {
-      echo "Index|File|Title|PID"
+      echo "Index|File|Title|PID|Opening"
       _get_monitored_files | while IFS= read -r line || [ -n "$line" ]; do
-        IFS="|" read -r file title pid tmp <<< "$line"
+        IFS="|" read -r file title pid tmp dead <<< "$line"
+        if [ -n "$dead" ]; then opening=false; else opening=true; fi
         if [ -z "$tmp" ]; then tmp=" "; fi
         if [ -z "$file" ]; then file=" "; fi
         if [ -z "$title" ]; then title=" "; fi
         if [ -z "$pid" ]; then pid=" "; fi
-        echo "$tmp|$file|$title|$pid"
+        echo "$tmp|$file|$title|$pid|$opening"
       done
     } | column -t -s "|"
   fi
@@ -352,6 +385,8 @@ function tmon_monitor() {
     line_array=()
     IFS="|" read -r -a line_array <<< "$line"
     file="${line_array[0]}"
+    dead="${line_array[4]}"
+    if [ -n "$dead" ]; then continue; fi
     if [ -z "${line_array[1]}" ]; then title=$(basename "$file"); else title="${line_array[1]}"; fi
     if [ -f "$file" ]; then
       if [ $use_sudo == true ]; then 
@@ -495,7 +530,7 @@ function tmon_exec() {
       tmux select-pane -T "$(_get_pane_title "$title")"
     fi
     abspath=$(_abspath "$stderr_file")
-    _monitor_append "$abspath" "$title" "$pid" "$tmp_index"
+    _monitor_append "$abspath" "$title" "$pid" "$tmp_index" ""
   fi
 
   if [ "$log_stdout" == true ]; then
@@ -506,7 +541,7 @@ function tmon_exec() {
       tmux select-pane -T "$(_get_pane_title "$title")"
     fi
     abspath=$(_abspath "$stdout_file")
-    _monitor_append "$abspath" "$title" "$pid" "$tmp_index"
+    _monitor_append "$abspath" "$title" "$pid" "$tmp_index" ""
   fi
   
   _monitor_file_check
@@ -617,7 +652,7 @@ function tmon_open() {
         dummy_stdout_file=$(_get_tmp_stdout "$tmp_index")
         touch "$dummy_stdout_file"
       fi
-      _monitor_append "$abspath" "$title" "" "$tmp_index"
+      _monitor_append "$abspath" "$title" "" "$tmp_index" ""
     fi
     i=$(expr $i + 1)
   done
@@ -716,7 +751,8 @@ function tmon_kill() {
   fi
   (cat "$monitor_file"; echo) | while IFS= read -r line; do
     if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
-    IFS="|" read -r file title pid tmp <<< "$line"
+    IFS="|" read -r file title pid tmp dead <<< "$line"
+    if [ -n "$dead" ]; then echo "$line" >> "$monitor_tmpfile"; continue; fi
     matched=false
     if [ $use_name == true -o $use_path == true ]; then
       if [ $use_name == true ]; then target=$title; else target=$file; fi
@@ -744,21 +780,26 @@ function tmon_kill() {
       fi
     fi
     if [ $matched == true ]; then
-      if [ -n "$pid" ]; then
+      if [ $kill == true -a -n "$pid" ]; then
         if [ $use_sudo == true ]; then
           "$sudo" kill "$pid" >/dev/null 2>/dev/null
         else
           kill "$pid" >/dev/null 2>/dev/null
         fi
       fi
-      if [ -n "$tmp" ]; then
-        echo "Killed $tmp"
-        tmp_stdout=$(_get_tmp_stdout "$tmp")
-        if [ -f "$tmp_stdout" ]; then rm -f "$tmp_stdout"; fi
-        tmp_stderr=$(_get_tmp_stderr "$tmp")
-        if [ -f "$tmp_stderr" ]; then rm -f "$tmp_stderr"; fi
+      if [ $kill == true -o -z "$pid" ]; then
+        if [ -n "$tmp" ]; then
+          echo "Killed $tmp"
+          tmp_stdout=$(_get_tmp_stdout "$tmp")
+          if [ -f "$tmp_stdout" ]; then rm -f "$tmp_stdout"; fi
+          tmp_stderr=$(_get_tmp_stderr "$tmp")
+          if [ -f "$tmp_stderr" ]; then rm -f "$tmp_stderr"; fi
+        else
+          echo "Killed"
+        fi
       else
-        echo "Killed"
+        if [ -n "$tmp" ]; then echo "Killed $tmp"; else echo "Killed"; fi
+        echo "$file|$title|$pid|$tmp|dead" >> "$monitor_tmpfile"
       fi
     else
       echo "$line" >> "$monitor_tmpfile"
