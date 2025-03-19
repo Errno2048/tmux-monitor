@@ -37,7 +37,7 @@ function _monitor_file_check() {
   monitor_file=$(_get_monitor_file)
   monitor_tmpfile="${monitor_file}.tmp"
   if [ ! -f "$monitor_file" ]; then
-    if [ -f "$monitor_tmpfile" ]; then mv "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+    if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
   else
     if [ -f "$monitor_tmpfile" ]; then rm -f "$monitor_tmpfile"; fi
   fi
@@ -63,8 +63,7 @@ function _monitor_file_check() {
       fi
     fi
   done < <(cat "$monitor_file"; echo)
-  if [ -f "$monitor_file" ]; then rm -f "$monitor_file"; fi
-  if [ -f "$monitor_tmpfile" ]; then mv "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+  if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
 }
 
 function _monitor_append() {
@@ -277,10 +276,10 @@ function tmon_ps() {
       if [ -z "$file" ]; then file=" "; fi
       if [ -z "$title" ]; then title=" "; fi
       if [ -z "$pid" ]; then pid=" "; fi
-      info=("${info[@]}" "$tmp|$file|$title|$pid|$status")
+      info=("${info[@]}" "$tmp|$status|$pid|$title|$file")
     done < <(_get_monitored_files)
     if [ "${#info[@]}" -gt 0 ]; then
-      info=("Index|File|Title|PID|Status" "${info[@]}")
+      info=("Monitor ID|Status|PID|Title|File" "${info[@]}")
       for line in "${info[@]}"; do
         echo "$line"
       done | column -t -s "|"
@@ -332,27 +331,30 @@ function tmon_clear() {
 }
 
 function _tmon_monitor_help() {
-  printf '%s\n' 'tmon monitor [-c | --clear] [-s | --sudo] [-h | --help] [NPANES]' \
+  printf '%s\n' 'tmon monitor [-c | --clear] [-s | --sudo] [-i | --id] [-h | --help] [[NPANES] | [ID]...]' \
                 '' \
                 'Open the last NPANES monitored files. Open 2 files when NPANES is not passed.' \
                 '' \
                 '  -c, --clear    Close all other panes before open.' \
                 '  -s, --sudo     Use sudo when opening files.' \
+                '  -i, --id       Open panes by monitor ID instead.' \
                 '  -h, --help     Display this help and exit.' \
                 '' \
                 'Examples:' \
-                '  tmon monitor -c 2    Clear current panes and open the last 2 monitored files' \
+                '  tmon monitor -c 2      Clear current panes and open the last 2 monitored files.' \
+                '  tmon monitor -i 100    Open the monitor of ID 100.' \
                 ''
   exit
 }
 
 function tmon_monitor() {
-  ARGUMENTS=$(getopt -o "c,s,h" -l "clear,sudo,help" -- "$@" 2>/dev/null) || _tmon_monitor_help
+  ARGUMENTS=$(getopt -o "c,s,i,h" -l "clear,sudo,id,help" -- "$@" 2>/dev/null) || _tmon_monitor_help
   eval "set -- ${ARGUMENTS}"
 
   args=()
   use_sudo=false
   clear=false
+  by_id=false
   while [ $# -gt 0 ]; do
     case "$1" in
       -c|--clear)
@@ -361,6 +363,10 @@ function tmon_monitor() {
         ;;
       -s|--sudo)
         use_sudo=true
+        shift
+        ;;
+      -i|--id)
+        by_id=true
         shift
         ;;
       -h|--help)
@@ -384,14 +390,55 @@ function tmon_monitor() {
   attached=$(in_session)
   if [ $attached == 0 ]; then _start_session; fi
   
-  if [ -z "${args[0]}" ]; then num_files=2; else num_files="${args[0]}"; fi
-  _get_monitored_files "$num_files" | while IFS= read -r line || [ -n "$line" ]; do
-    line_array=()
-    IFS="|" read -r -a line_array <<< "$line"
-    file="${line_array[0]}"
-    dead="${line_array[4]}"
-    if [ -n "$dead" ]; then continue; fi
-    if [ -z "${line_array[1]}" ]; then title=$(basename "$file"); else title="${line_array[1]}"; fi
+  target_files=()
+  if [ "$by_id" == true ]; then
+    lines=()
+    open_dead=false
+    while IFS= read -r line || [ -n "$line" ]; do
+      IFS="|" read -r file title pid tmp dead <<< "$line"
+      success=false
+      for monitor_id in "${args[@]}"; do
+        if [ "$monitor_id" == "$tmp" ]; then
+          if [ ! $use_sudo == true -a ! -r "$file" ]; then break; fi
+          if [ -z "$title" ]; then title=$(basename "$file"); fi
+          target_files=("${target_files[@]}" "$file|$title")
+          success=true
+          break
+        fi
+      done
+      if [ $success == true ]; then
+        if [ -n "$dead" ]; then open_dead=true; fi
+        lines=("${lines[@]}" "$file|$title|$pid|$tmp|")
+      else
+        lines=("${lines[@]}" "$line")
+      fi
+    done < <(_get_monitored_files)
+    if [ $open_dead == true ]; then
+      monitor_file=$(_get_monitor_file)
+      monitor_tmpfile="${monitor_file}.tmp"
+      if [ ! -f "$monitor_file" ]; then
+        if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+      else
+        if [ -f "$monitor_tmpfile" ]; then rm -f "$monitor_tmpfile"; fi
+      fi
+      for line in "${lines[@]}"; do
+        echo "$line" >> "$monitor_tmpfile"
+      done
+      if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+    fi
+  else
+    if [ -z "${args[0]}" ]; then num_files=2; else num_files="${args[0]}"; fi
+    while IFS= read -r line || [ -n "$line" ]; do
+      IFS="|" read -r file title pid tmp dead <<< "$line"
+      if [ -n "$dead" ]; then continue; fi
+      if [ ! $use_sudo == true -a ! -r "$file" ]; then continue; fi
+      if [ -z "$title" ]; then title=$(basename "$file"); fi
+      target_files=("${target_files[@]}" "$file|$title")
+    done < <(_get_monitored_files "$num_files")
+  fi
+  
+  for file_title in "${target_files[@]}"; do
+    IFS="|" read -r file title <<< "$file_title"
     if [ -f "$file" ]; then
       if [ $use_sudo == true ]; then 
         tmux split-window -v "\"$sudo\" tail -n +0 -f \"${file}\""
@@ -672,7 +719,7 @@ function _tmon_kill_help() {
   printf '%s\n' 'tmon kill [-t | --title] [-f | --file] [-p | --pid] [-P | --process] [-s | --sudo]' \
                 '          [--full-match] [-r | --regex] [-h | --help] [NAMES]...' \
                 '' \
-                'Remove file monitors. By default, remove monitors by temporary file ID.' \
+                'Remove file monitors. By default, remove monitors by monitor ID.' \
                 '' \
                 '  -t, --title         Remove monitors by pane title.' \
                 '  -f, --file          Remove monitors by file path.' \
@@ -749,11 +796,11 @@ function tmon_kill() {
   monitor_file=$(_get_monitor_file)
   monitor_tmpfile="${monitor_file}.tmp"
   if [ ! -f "$monitor_file" ]; then
-    if [ -f "$monitor_tmpfile" ]; then mv "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+    if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
   else
     if [ -f "$monitor_tmpfile" ]; then rm -f "$monitor_tmpfile"; fi
   fi
-  (cat "$monitor_file"; echo) | while IFS= read -r line; do
+  while IFS= read -r line; do
     if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
     IFS="|" read -r file title pid tmp dead <<< "$line"
     if [ -n "$dead" ]; then echo "$line" >> "$monitor_tmpfile"; continue; fi
@@ -808,9 +855,8 @@ function tmon_kill() {
     else
       echo "$line" >> "$monitor_tmpfile"
     fi
-  done
-  if [ -f "$monitor_file" ]; then rm -f "$monitor_file"; fi
-  if [ -f "$monitor_tmpfile" ]; then mv "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+  done < <(cat "$monitor_file"; echo)
+  if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
 }
 
 function _help() {
