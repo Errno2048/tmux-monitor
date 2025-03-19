@@ -288,30 +288,24 @@ function tmon_ps() {
 }
 
 function _clear_help() {
-  printf '%s\n' 'tmon clear [-a | --all] [-h | --help]' \
-                'Close all panes.' \
+  printf '%s\n' 'tmon clear [-h | --help]' \
+                'Close all panes but preserve file monitors.' \
                 '' \
-                '  -a, --all     Remove file monitors.' \
                 '  -h, --help    Display this help and exit.' \
                 '' \
                 'Examples:' \
-                '  tmon clear -a    Close all panes and remove all file monitors.'
+                '  tmon clear    Close all panes.'
                 ''
   exit
 }
 
 function tmon_clear() {
-  ARGUMENTS=$(getopt -o "a,h" -l "all,help" -- "$@" 2>/dev/null) || _clear_help
+  ARGUMENTS=$(getopt -o "h" -l "help" -- "$@" 2>/dev/null) || _clear_help
   eval "set -- ${ARGUMENTS}"
   
   args=()
-  clear_cache=false
   while [ $# -gt 0 ]; do
     case "$1" in
-      -a|--all)
-        clear_cache=true
-        shift
-        ;;
       -h|--help)
         _clear_help
         ;;
@@ -327,22 +321,21 @@ function tmon_clear() {
 
   if [ $(current_pane) != 0 ]; then tmux swap-pane -U; fi
   tmux kill-pane -a -t 0
-  if [ $clear_cache == true ]; then _monitor_clear; fi
 }
 
 function _tmon_monitor_help() {
-  printf '%s\n' 'tmon monitor [-c | --clear] [-s | --sudo] [-i | --id] [-a | --all] [-h | --help] [[NPANES] | [ID]...]' \
+  printf '%s\n' 'tmon monitor [-p | --preserve] [-s | --sudo] [-i | --id] [-a | --all] [-h | --help] [[NPANES] | [ID]...]' \
                 '' \
-                'Open the last NPANES monitored files. Open 2 files when NPANES is not passed.' \
+                'Clear all panes and open the last NPANES monitored files. Open 2 files when NPANES is not passed.' \
                 '' \
-                '  -c, --clear    Close all other panes before open.' \
-                '  -s, --sudo     Use sudo when opening files.' \
-                '  -i, --id       Open panes by monitor ID instead.' \
-                '  -a, --all      Open all monitors and ignore NPANES or ID.' \
-                '  -h, --help     Display this help and exit.' \
+                '  -p, --preserve    Do not close panes before open.' \
+                '  -s, --sudo        Use sudo when opening files.' \
+                '  -i, --id          Open panes by monitor ID instead.' \
+                '  -a, --all         Open all monitors and ignore NPANES or ID.' \
+                '  -h, --help        Display this help and exit.' \
                 '' \
                 'Examples:' \
-                '  tmon monitor -c 2      Clear current panes and open the last 2 monitored files.' \
+                '  tmon monitor -p 2      Preserve current panes and open the last 2 monitored files.' \
                 '  tmon monitor -i 100    Open the monitor of ID 100.' \
                 ''
   exit
@@ -354,13 +347,13 @@ function tmon_monitor() {
 
   args=()
   use_sudo=false
-  clear=false
+  clear=true
   by_id=false
   show_all=false
   while [ $# -gt 0 ]; do
     case "$1" in
-      -c|--clear)
-        clear=true
+      -p|--preserve)
+        clear=false
         shift
         ;;
       -s|--sudo)
@@ -435,13 +428,19 @@ function tmon_monitor() {
     fi
   else
     if [ -z "${args[0]}" ]; then num_files=2; else num_files="${args[0]}"; fi
+    lines=()
     while IFS= read -r line || [ -n "$line" ]; do
       IFS="|" read -r file title pid tmp dead <<< "$line"
       if [ -n "$dead" ]; then continue; fi
       if [ ! $use_sudo == true -a ! -r "$file" ]; then continue; fi
       if [ -z "$title" ]; then title=$(basename "$file"); fi
-      target_files=("${target_files[@]}" "$file|$title")
-    done < <(_get_monitored_files "$num_files")
+      lines=("$file|$title" "${lines[@]}")
+    done < <(_get_monitored_files)
+    for line in "${lines[@]}"; do
+      IFS="|" read -r file title <<< "$line"
+      target_files=("$file|$title" "${target_files[@]}")
+      if [ "${#target_files[@]}" -ge "$num_files" ]; then break; fi
+    done
   fi
   
   for file_title in "${target_files[@]}"; do
@@ -724,9 +723,9 @@ function tmon_open() {
 
 function _tmon_kill_help() {
   printf '%s\n' 'tmon kill [-t | --title] [-f | --file] [-p | --pid] [-P | --process] [-s | --sudo]' \
-                '          [--full-match] [-r | --regex] [-h | --help] [NAMES]...' \
+                '          [--full-match] [-r | --regex] [-h | --help] [--preserve] [-a | --all] [NAMES]...' \
                 '' \
-                'Remove file monitors. By default, remove monitors by monitor ID.' \
+                'Remove file monitors and corresponding panes. By default, remove monitors by monitor ID.' \
                 '' \
                 '  -t, --title         Remove monitors by pane title.' \
                 '  -f, --file          Remove monitors by file path.' \
@@ -735,17 +734,21 @@ function _tmon_kill_help() {
                 '  -p, --pid           Remove monitors by PID.' \
                 '  -P, --process       Kill the corresponding processes.' \
                 '  -s, --sudo          Use sudo when killing processes.' \
+                '      --preserve      Do not kill corresponding panes.' \
+                '  -a, --all           Clear all file monitors.' \
                 '  -h, --help          Display this help and exit.' \
                 '' \
                 'Examples:' \
                 '  tmon kill 10          Remove monitor of temporary file 10.' \
                 '  tmon kill -t TITLE    Remove monitor with title TITLE.' \
+                '  tmon kill -a -P --preserve' \
+                '      Remove all file monitors and kill processes but preserve panes.' \
                 ''
   exit
 }
 
 function tmon_kill() {
-  ARGUMENTS=$(getopt -o "t,f,p,P,s,h" -l "title,file,pid,process,sudo,help,full-match" -- "$@" 2>/dev/null) || _tmon_kill_help
+  ARGUMENTS=$(getopt -o "t,f,p,P,s,a,h" -l "title,file,pid,process,sudo,help,full-match,all,preserve" -- "$@" 2>/dev/null) || _tmon_kill_help
   eval "set -- ${ARGUMENTS}"
 
   args=()
@@ -754,8 +757,10 @@ function tmon_kill() {
   use_path=false
   use_pid=false
   kill=false
+  clear_all=false
   regex=false
   full_match=false
+  kill_panes=true
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -t|--title)
@@ -786,6 +791,14 @@ function tmon_kill() {
         use_sudo=true
         shift
         ;;
+      --preserve)
+        kill_panes=false
+        shift
+        ;;
+      -a|--all)
+        clear_all=true
+        shift
+        ;;
       -h|--help)
         _tmon_kill_help
         ;;
@@ -802,15 +815,51 @@ function tmon_kill() {
   _prepare_tmp
   monitor_file=$(_get_monitor_file)
   monitor_tmpfile="${monitor_file}.tmp"
+
   if [ ! -f "$monitor_file" ]; then
     if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
   else
     if [ -f "$monitor_tmpfile" ]; then rm -f "$monitor_tmpfile"; fi
   fi
+ 
+ if [ $clear_all == true ]; then
+    _monitor_clear
+    if [ $kill == true ]; then
+      (cat "$monitor_file"; echo) | while IFS= read -r line; do
+        if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
+        IFS="|" read -r file title pid tmp dead <<< "$line"
+        if [ -n "$pid" ]; then
+          if [ $use_sudo == true ]; then
+            if "$sudo" kill "$pid" >/dev/null 2>/dev/null; then continue; fi
+          else
+            if kill "$pid" >/dev/null 2>/dev/null; then continue; fi
+          fi
+          echo "$line" >> "$monitor_tmpfile"
+        fi
+      done
+    fi
+    if [ $kill_panes == true ]; then
+      tmux kill-pane -a -t 0
+      _set_layout
+    fi
+    if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+    return
+  fi
+  
   (cat "$monitor_file"; echo) | while IFS= read -r line; do
     if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
     IFS="|" read -r file title pid tmp dead <<< "$line"
-    if [ -n "$dead" ]; then echo "$line" >> "$monitor_tmpfile"; continue; fi
+    if [ -n "$dead" ]; then
+      if [ $kill == true ]; then
+        if [ $use_sudo == true ]; then
+          if "$sudo" kill "$pid" >/dev/null 2>/dev/null; then continue; fi
+        else
+          if kill "$pid" >/dev/null 2>/dev/null; then continue; fi
+        fi
+      fi
+      echo "$line" >> "$monitor_tmpfile"
+      continue
+    fi
     matched=false
     if [ $use_name == true -o $use_path == true ]; then
       if [ $use_name == true ]; then target=$title; else target=$file; fi
@@ -838,14 +887,15 @@ function tmon_kill() {
       fi
     fi
     if [ $matched == true ]; then
+      killed=$kill
       if [ $kill == true -a -n "$pid" ]; then
         if [ $use_sudo == true ]; then
-          "$sudo" kill "$pid" >/dev/null 2>/dev/null
+          if "$sudo" kill "$pid" >/dev/null 2>/dev/null; then :; else killed=false; fi
         else
-          kill "$pid" >/dev/null 2>/dev/null
+          if kill "$pid" >/dev/null 2>/dev/null; then :; else killed=false; fi
         fi
       fi
-      if [ $kill == true -o -z "$pid" ]; then
+      if [ $killed == true -o -z "$pid" ]; then
         if [ -n "$tmp" ]; then
           echo "Killed $tmp"
           tmp_stdout=$(_get_tmp_stdout "$tmp")
@@ -859,15 +909,36 @@ function tmon_kill() {
         if [ -n "$tmp" ]; then echo "Killed $tmp"; else echo "Killed"; fi
         echo "$file|$title|$pid|$tmp|dead" >> "$monitor_tmpfile"
       fi
+      if [ $kill_panes == true -a -n "$title" ]; then
+        for pane_id in "$(_find_panes_by_title "$title")"; do
+          if [ "$pane_id" == 0 ]; then continue; fi
+          tmux kill-pane -t "$pane_id"
+        done
+      fi
     else
       echo "$line" >> "$monitor_tmpfile"
     fi
   done
+  if [ $kill_panes == true ]; then _set_layout; fi
   if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
 }
 
 function _help() {
-  printf "%s\n" "tmon [ps | open | exec | monitor | kill | clear | exit] [...]"
+  printf "%s\n" 'tmon COMMAND [...]' \
+                '' \
+                'A file and process monitor shell script based on tmux.' \
+                '' \
+                'Commands:' \
+                '  ps       List file monitors.' \
+                '  open     Create a file monitor and show file content in a pane.' \
+                '  monitor  Show monitored files in panes.' \
+                '  kill     Remove a file monitor and corresponding panes.' \
+                '  clear    Close other tmux panes.' \
+                '  exit     Exit tmux.' \
+                '' \
+                "Run 'tmon COMMAND --help' for more information on a command." \
+                ''
+  exit
 }
 
 subparser=$1
@@ -901,7 +972,6 @@ case "$subparser" in
     ;;
   *)
     _help
-    exit
     ;;
 esac
 
