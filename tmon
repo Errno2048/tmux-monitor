@@ -331,13 +331,14 @@ function tmon_clear() {
 }
 
 function _tmon_monitor_help() {
-  printf '%s\n' 'tmon monitor [-c | --clear] [-s | --sudo] [-i | --id] [-h | --help] [[NPANES] | [ID]...]' \
+  printf '%s\n' 'tmon monitor [-c | --clear] [-s | --sudo] [-i | --id] [-a | --all] [-h | --help] [[NPANES] | [ID]...]' \
                 '' \
                 'Open the last NPANES monitored files. Open 2 files when NPANES is not passed.' \
                 '' \
                 '  -c, --clear    Close all other panes before open.' \
                 '  -s, --sudo     Use sudo when opening files.' \
                 '  -i, --id       Open panes by monitor ID instead.' \
+                '  -a, --all      Open all monitors and ignore NPANES or ID.' \
                 '  -h, --help     Display this help and exit.' \
                 '' \
                 'Examples:' \
@@ -348,13 +349,14 @@ function _tmon_monitor_help() {
 }
 
 function tmon_monitor() {
-  ARGUMENTS=$(getopt -o "c,s,i,h" -l "clear,sudo,id,help" -- "$@" 2>/dev/null) || _tmon_monitor_help
+  ARGUMENTS=$(getopt -o "c,s,i,a,h" -l "clear,sudo,id,all,help" -- "$@" 2>/dev/null) || _tmon_monitor_help
   eval "set -- ${ARGUMENTS}"
 
   args=()
   use_sudo=false
   clear=false
   by_id=false
+  show_all=false
   while [ $# -gt 0 ]; do
     case "$1" in
       -c|--clear)
@@ -367,6 +369,10 @@ function tmon_monitor() {
         ;;
       -i|--id)
         by_id=true
+        shift
+        ;;
+      -a|--all)
+        show_all=true
         shift
         ;;
       -h|--help)
@@ -391,23 +397,24 @@ function tmon_monitor() {
   if [ $attached == 0 ]; then _start_session; fi
   
   target_files=()
-  if [ "$by_id" == true ]; then
+  if [ "$by_id" == true -o "$show_all" == true ]; then
     lines=()
     open_dead=false
     while IFS= read -r line || [ -n "$line" ]; do
       IFS="|" read -r file title pid tmp dead <<< "$line"
       success=false
-      for monitor_id in "${args[@]}"; do
-        if [ "$monitor_id" == "$tmp" ]; then
-          if [ ! $use_sudo == true -a ! -r "$file" ]; then break; fi
-          if [ -z "$title" ]; then title=$(basename "$file"); fi
-          target_files=("${target_files[@]}" "$file|$title")
-          success=true
-          break
-        fi
-      done
+      if [ "$show_all" == true ]; then
+        success=true
+      else
+        for monitor_id in "${args[@]}"; do
+          if [ "$monitor_id" == "$tmp" ]; then success=true; break; fi
+        done
+      fi
+      if [ ! $use_sudo == true -a ! -r "$file" ]; then success=false; fi
       if [ $success == true ]; then
+        if [ -z "$title" ]; then title=$(basename "$file"); fi
         if [ -n "$dead" ]; then open_dead=true; fi
+        target_files=("${target_files[@]}" "$file|$title")
         lines=("${lines[@]}" "$file|$title|$pid|$tmp|")
       else
         lines=("${lines[@]}" "$line")
