@@ -47,11 +47,11 @@ function _monitor_file_check() {
     line_array=()
     IFS="|" read -r file title pid tmp dead <<< "$line"
     if [ -z "$pid" ]; then
-      echo "$line" >> "$monitor_tmpfile"
+      echo "$line"
       num_lines=$(expr $num_lines + 1)
     else
       if kill -0 "$pid" 2>/dev/null; then
-        echo "$line" >> "$monitor_tmpfile"
+        echo "$line"
         num_lines=$(expr $num_lines + 1)
       else
         if [ -n "$tmp" ]; then
@@ -62,7 +62,7 @@ function _monitor_file_check() {
         fi
       fi
     fi
-  done < <(cat "$monitor_file"; echo)
+  done < <(cat "$monitor_file"; echo) >> "$monitor_tmpfile"
   if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
 }
 
@@ -807,7 +807,7 @@ function tmon_kill() {
   else
     if [ -f "$monitor_tmpfile" ]; then rm -f "$monitor_tmpfile"; fi
   fi
-  while IFS= read -r line; do
+  (cat "$monitor_file"; echo) | while IFS= read -r line; do
     if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
     IFS="|" read -r file title pid tmp dead <<< "$line"
     if [ -n "$dead" ]; then echo "$line" >> "$monitor_tmpfile"; continue; fi
@@ -862,7 +862,7 @@ function tmon_kill() {
     else
       echo "$line" >> "$monitor_tmpfile"
     fi
-  done < <(cat "$monitor_file"; echo)
+  done
   if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
 }
 
