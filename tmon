@@ -2,37 +2,37 @@
 sudo=sudo
 tmp_path="/tmp/tmon-$(whoami)"
 
-function _abspath() {
+_abspath() {
   if [ -z "$1" ]; then return; fi
-  dirname=$(cd "$(dirname "$1")"; pwd)
+  dirname=$(cd "$(dirname "$1")" || exit; pwd)
   basename=$(basename "$1")
   echo "$dirname/$basename"
 }
 
-function _prepare_tmp() {
+_prepare_tmp() {
   if [ ! -d "$tmp_path" ]; then
     if [ -e "$tmp_path" ]; then rm -f "$tmp_path"; fi
     mkdir -p "$tmp_path"
   fi
 }
 
-function _check_monitor_arg() {
+_check_monitor_arg() {
   while [ $# -gt 0 ]; do
-    if [ $(expr index "$1" :) -ne 0 ]; then echo 1; fi
+    if [ "$(expr index "$1" :)" -ne 0 ]; then echo 1; fi
     shift
   done
   echo 0
 }
 
-function _escape_monitor_arg() {
+_escape_monitor_arg() {
   echo "$1" | sed "s/|/ /g"
 }
 
-function _get_monitor_file() {
+_get_monitor_file() {
   echo "$tmp_path/monitor"
 }
 
-function _monitor_file_check() {
+_monitor_file_check() {
   _prepare_tmp
   monitor_file=$(_get_monitor_file)
   monitor_tmpfile="${monitor_file}.tmp"
@@ -43,8 +43,7 @@ function _monitor_file_check() {
   fi
   num_lines=0
   while IFS= read -r line; do
-    if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
-    line_array=()
+    if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then continue; fi
     IFS="|" read -r file title pid tmp dead <<< "$line"
     if [ -z "$pid" ]; then
       echo "$line"
@@ -66,15 +65,15 @@ function _monitor_file_check() {
   if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
 }
 
-function _monitor_append() {
+_monitor_append() {
   _prepare_tmp
   monitor_file=$(_get_monitor_file)
   if [ ! -f "$monitor_file" ]; then touch "$monitor_file"; fi
-  if [ $(_check_monitor_arg "$@") -ne 0 ]; then return; fi
+  if [ "$(_check_monitor_arg "$@")" -ne 0 ]; then return; fi
   (IFS="|"; echo "$*" >> "$monitor_file")
 }
 
-function _monitor_clear() {
+_monitor_clear() {
   monitor_file=$(_get_monitor_file)
   if [ ! -f "$monitor_file" ]; then
     if [ -d "$tmp_path" ]; then
@@ -84,8 +83,7 @@ function _monitor_clear() {
     preserved=()
     preserved_tmp=()
     while IFS= read -r line; do
-      if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
-      line_array=()
+      if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then continue; fi
       IFS="|" read -r file title pid tmp dead <<< "$line"
       if [ -n "$pid" ]; then
         if kill -0 "$pid" 2>/dev/null; then
@@ -114,46 +112,45 @@ function _monitor_clear() {
   fi
 }
 
-function _get_monitored_files() {
+_get_monitored_files() {
   monitor_file=$(_get_monitor_file)
   if [ ! -f "$monitor_file" ]; then return; fi
-  if [ -z "$1" ]; then num="+0"; else num="$1"; fi
   _monitor_file_check
-  tail -n "$num" "$monitor_file" | while IFS= read -r line || [ -n "$line" ]; do
-    echo "$line"
+  (cat "$monitor_file" && echo) | while IFS= read -r line || [ -n "$line" ]; do
+    if [ -n "$line" ]; then echo "$line"; fi
   done
 }
 
-function _get_tmp_stdout() {
+_get_tmp_stdout() {
   if [ -z "$1" ]; then return; fi
   echo "${tmp_path}/$1.out"
 }
 
-function _get_tmp_stderr() {
+_get_tmp_stderr() {
   if [ -z "$1" ]; then return; fi
   echo "${tmp_path}/$1.err"
 }
 
-function _get_tmp_index() {
+_get_tmp_index() {
   _prepare_tmp
   loop_times=0
   while [ $loop_times -lt 32768 ]; do
     base_index=$(expr $loop_times \* 32768)
     init_index=$RANDOM
-    tmp_index=$(expr $(expr $(expr $init_index + 1) % 32768) + $base_index)
+    tmp_index=$(expr "$(expr "$(expr $init_index + 1)" % 32768)" + $base_index)
     while [ ! $tmp_index == $init_index ]; do
-      if [ ! -e $(_get_tmp_stdout "$tmp_index") -a ! -e $(_get_tmp_stderr "$tmp_index") ]; then
+      if [ ! -e "$(_get_tmp_stdout "$tmp_index")" -a ! -e "$(_get_tmp_stderr "$tmp_index")" ]; then
         echo "$tmp_index"
         return
       fi
-      tmp_index=$(expr $(expr $tmp_index + 1) % 32768)
+      tmp_index=$(expr "$(expr $tmp_index + 1)" % 32768)
     done
     loop_times=$(expr $loop_times + 1)
   done
   echo ""; return
 }
 
-function _start_session() {
+_start_session() {
   tmux new -d
   tmux set status-style "bg=black,fg=green"
   tmux set pane-border-format "#{pane_title}"
@@ -161,22 +158,22 @@ function _start_session() {
   tmux set mouse on
 }
 
-function _get_window_width() {
-  echo $(tmux display-message -p "#{window_width}" 2>/dev/null)
+_get_window_width() {
+  echo "$(tmux display-message -p "#{window_width}" 2>/dev/null)"
 }
 
-function _set_layout() {
+_set_layout() {
   tmux select-layout main-vertical
   tmux select-pane -t 0
   tmux select-pane -T ""
   tmux resize-pane -x 50% 2>/dev/null
   if [ $? -ne 0 ]; then
     width=$(_get_window_width)
-    if [ -n width ]; then tmux resize-pane -x $(expr "${width}" / 2); fi
+    if [ -n "$width" ]; then tmux resize-pane -x "$(expr "${width}" / 2)"; fi
   fi
 }
 
-function _is_attached() {
+_is_attached() {
   if [ -z "$1" ]; then
     sessionid=$(tmux display -p '#S') || sessionid=-1
     if [ ${sessionid} == -1 ]; then return 0; fi
@@ -188,37 +185,37 @@ function _is_attached() {
   return 0
 }
 
-function is_attached() {
+is_attached() {
   _is_attached "$@" 2>/dev/null
   echo $?
 }
 
-function in_session() {
+in_session() {
   if [ -n "$TMUX" ]; then echo 1; else echo 0; fi
 }
 
-function exit_session() {
+exit_session() {
   _is_attached 2>/dev/null
   if [ $? == 1 ]; then tmux kill-session; fi
 }
 
-function current_pane() {
+current_pane() {
   if [ -z "$TMUX_PANE" ]; then
     echo -1
   else
-    echo $(tmux list-panes -F "#P@#D" | grep "@$TMUX_PANE" | sed "s/@$TMUX_PANE//g")
+    echo "$(tmux list-panes -F "#P@#D" | grep "@$TMUX_PANE" | sed "s/@$TMUX_PANE//g")"
   fi
 }
 
-function _find_panes_by_title() {
+_find_panes_by_title() {
   if [ -z "$1" ]; then return; fi
-  echo $(tmux list-panes -F "#P:#T" | grep -E "^[0-9]+:.*?$1.*$" | sed "s/:.*//g")
+  echo "$(tmux list-panes -F "#P:#T" | grep -E "^[0-9]+:.*?$1.*$" | sed "s/:.*//g")"
 }
 
-function _get_pane_title() {
+_get_pane_title() {
   if [ -z "$1" ]; then echo ""; return; fi
   width=$(_get_window_width)
-  max_title_size=$(expr $(expr "$width" / 2) - 5)
+  max_title_size=$(expr "$(expr "$width" / 2)" - 5)
   if [ $max_title_size -gt 4 ]; then
     title=$(echo "$1" | cut -c "-$(expr $max_title_size - 4)")
     echo "[ $title ]"
@@ -228,7 +225,7 @@ function _get_pane_title() {
   fi
 }
 
-function _tmon_ps_help() {
+_tmon_ps_help() {
   printf '%s\n' 'tmon ps [--raw] [-h | --help]' \
                 'List all monitored files.' \
                 '' \
@@ -238,7 +235,7 @@ function _tmon_ps_help() {
   exit
 }
 
-function tmon_ps() {
+tmon_ps() {
   ARGUMENTS=$(getopt -o "h" -l "raw,help" -- "$@" 2>/dev/null) || _tmon_ps_help
   eval "set -- ${ARGUMENTS}"
   
@@ -287,7 +284,7 @@ function tmon_ps() {
   fi
 }
 
-function _clear_help() {
+_clear_help() {
   printf '%s\n' 'tmon clear [-h | --help]' \
                 'Close all panes but preserve file monitors.' \
                 '' \
@@ -299,7 +296,7 @@ function _clear_help() {
   exit
 }
 
-function tmon_clear() {
+tmon_clear() {
   ARGUMENTS=$(getopt -o "h" -l "help" -- "$@" 2>/dev/null) || _clear_help
   eval "set -- ${ARGUMENTS}"
   
@@ -319,11 +316,11 @@ function tmon_clear() {
     esac
   done
 
-  if [ $(current_pane) != 0 ]; then tmux swap-pane -U; fi
+  if [ "$(current_pane)" != 0 ]; then tmux swap-pane -U; fi
   tmux kill-pane -a -t 0
 }
 
-function _tmon_monitor_help() {
+_tmon_monitor_help() {
   printf '%s\n' 'tmon monitor [-p | --preserve] [-s | --sudo] [-i | --id] [-a | --all] [-h | --help] [[NPANES] | [ID]...]' \
                 '' \
                 'Clear all panes and open the last NPANES monitored files. Open 2 files when NPANES is not passed.' \
@@ -341,7 +338,7 @@ function _tmon_monitor_help() {
   exit
 }
 
-function tmon_monitor() {
+tmon_monitor() {
   ARGUMENTS=$(getopt -o "c,s,i,a,h" -l "clear,sudo,id,all,help" -- "$@" 2>/dev/null) || _tmon_monitor_help
   eval "set -- ${ARGUMENTS}"
 
@@ -382,7 +379,7 @@ function tmon_monitor() {
   done
   
   if [ "$clear" == true ]; then
-    if [ $(current_pane) != 0 ]; then tmux swap-pane -U; fi
+    if [ "$(current_pane)" != 0 ]; then tmux swap-pane -U; fi
     tmux kill-pane -a -t 0
   fi
   
@@ -460,7 +457,7 @@ function tmon_monitor() {
   if [ $attached == 0 ]; then tmux attach; fi
 }
 
-function _tmon_exec_help() {
+_tmon_exec_help() {
   printf '%s\n' 'tmon exec [-o] [-e] [--stdout FILE] [--stderr FILE] [-s | --sudo] [-d | --detach]' \
                 '          [-t | --title TITLE] [-a | --append] [-h | --help] ARGS...' \
                 '' \
@@ -484,7 +481,7 @@ function _tmon_exec_help() {
   exit
 }
 
-function tmon_exec() {
+tmon_exec() {
   args=()
   use_sudo=false
   detached=false
@@ -547,7 +544,7 @@ function tmon_exec() {
   
   tmp_index=$(_get_tmp_index)
   if [ -n "$tmp_index" ]; then
-    touch $(_get_tmp_stdout "$tmp_index")
+    touch "$(_get_tmp_stdout "$tmp_index")"
   fi
   if [ -z "$stdout_file" -o -z "$stderr_file" ]; then
     if [ -z "$tmp_index" ]; then
@@ -609,7 +606,7 @@ function tmon_exec() {
   fi
 }
 
-function _tmon_open_help() {
+_tmon_open_help() {
   printf '%s\n' 'tmon open [-c | --create] [-C | --cut NCOLS] [-s | --sudo] [-f | --full] ' \
                 '          [-t | --title TITLE] [-d | --detach] [-h | --help] [FILE]...' \
                 '' \
@@ -630,7 +627,7 @@ function _tmon_open_help() {
   exit
 }
 
-function tmon_open() {
+tmon_open() {
   ARGUMENTS=$(getopt -o "s,c,C:,f,t:,d,h" -l "sudo,create,cut:,full,title:,detach,help" -- "$@" 2>/dev/null) || _tmon_open_help
   eval "set -- ${ARGUMENTS}"
 
@@ -721,13 +718,14 @@ function tmon_open() {
   fi
 }
 
-function _tmon_kill_help() {
+_tmon_kill_help() {
   printf '%s\n' 'tmon kill [-t | --title] [-f | --file] [-p | --pid] [-P | --process] [-s | --sudo]' \
                 '          [--full-match] [-r | --regex] [-h | --help] [--preserve] [-a | --all] [NAMES]...' \
                 '' \
                 'Remove file monitors and corresponding panes. By default, remove monitors by monitor ID.' \
                 '' \
                 '  -t, --title         Remove monitors by pane title.' \
+                '                      Please be cautious that all panes of the same title will be killed.' \
                 '  -f, --file          Remove monitors by file path.' \
                 '      --full-match    When passed, only fully matched files (or titles) will be removed.' \
                 '  -r, --regex         Use regular expression matching.' \
@@ -747,7 +745,7 @@ function _tmon_kill_help() {
   exit
 }
 
-function tmon_kill() {
+tmon_kill() {
   ARGUMENTS=$(getopt -o "t,f,p,P,s,a,h" -l "title,file,pid,process,sudo,help,full-match,all,preserve" -- "$@" 2>/dev/null) || _tmon_kill_help
   eval "set -- ${ARGUMENTS}"
 
@@ -761,7 +759,7 @@ function tmon_kill() {
   regex=false
   full_match=false
   kill_panes=true
-  while [[ $# -gt 0 ]]; do
+  while [ $# -gt 0 ]; do
     case "$1" in
       -t|--title)
         use_name=true
@@ -826,7 +824,7 @@ function tmon_kill() {
     _monitor_clear
     if [ $kill == true ]; then
       (cat "$monitor_file"; echo) | while IFS= read -r line; do
-        if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
+        if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then continue; fi
         IFS="|" read -r file title pid tmp dead <<< "$line"
         if [ -n "$pid" ]; then
           if [ $use_sudo == true ]; then
@@ -847,7 +845,7 @@ function tmon_kill() {
   fi
   
   (cat "$monitor_file"; echo) | while IFS= read -r line; do
-    if [ -z $(echo "$line" | tr -d '[:space:]') ]; then continue; fi
+    if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then continue; fi
     IFS="|" read -r file title pid tmp dead <<< "$line"
     if [ -n "$dead" ]; then
       if [ $kill == true ]; then
@@ -866,13 +864,13 @@ function tmon_kill() {
       for value in "${args[@]}"; do
         if [ $full_match == true ]; then
           if [ $regex == true ]; then
-            if [ -n $(echo "$target" | grep -E -x "$value") ]; then matched=true; break; fi
+            if [ -n "$(echo "$target" | grep -E -x "$value")" ]; then matched=true; break; fi
           else
             if [ "$target" == "$value" ]; then matched=true; break; fi
           fi
         else
           if [ $regex == true ]; then
-            if [ -n $(echo "$target" | grep -E "$value") ]; then matched=true; break; fi
+            if [ -n "$(echo "$target" | grep -E "$value")" ]; then matched=true; break; fi
           else
             if expr "$target" : ".*$value" >/dev/null; then matched=true; break; fi
           fi
@@ -910,8 +908,7 @@ function tmon_kill() {
         echo "$file|$title|$pid|$tmp|dead" >> "$monitor_tmpfile"
       fi
       if [ $kill_panes == true -a -n "$title" ]; then
-        for pane_id in "$(_find_panes_by_title "$title")"; do
-          if [ "$pane_id" == 0 ]; then continue; fi
+        for pane_id in $(_find_panes_by_title "$title"); do
           tmux kill-pane -t "$pane_id"
         done
       fi
@@ -923,7 +920,7 @@ function tmon_kill() {
   if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
 }
 
-function _help() {
+_help() {
   printf "%s\n" 'tmon COMMAND [...]' \
                 '' \
                 'A file and process monitor shell script based on tmux.' \
