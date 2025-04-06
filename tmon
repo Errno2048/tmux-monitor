@@ -225,6 +225,22 @@ _get_pane_title() {
   fi
 }
 
+_kill_process() {
+  if [ -z "$1" ]; then return 1; fi
+  kill_command=$1
+  shift
+  success=true
+  while [ $# -gt 0 ]; do
+    if ! $kill_command "$1" >/dev/null 2>/dev/null; then
+      if $kill_command -0 "$1" >/dev/null 2>/dev/null; then
+        success=false
+      fi
+    fi
+    shift
+  done
+  if [ "$success" == true ]; then return 0; else return 1; fi
+}
+
 _tmon_ps_help() {
   printf '%s\n' 'tmon ps [--raw] [-h | --help]' \
                 'List all monitored files.' \
@@ -569,7 +585,6 @@ tmon_exec() {
   fi
   "${args[@]}" >/dev/null 2>/dev/null &
   pid=$!
-  pid=$(pgrep -P "$pid" || echo "$pid")
 
   if [ ! "$detached" == true ]; then
     attached=$(in_session)
@@ -827,10 +842,11 @@ tmon_kill() {
         if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then continue; fi
         IFS="|" read -r file title pid tmp dead <<< "$line"
         if [ -n "$pid" ]; then
+          child_pid=$(pgrep -P "$pid" || echo "$pid")
           if [ $use_sudo == true ]; then
-            if "$sudo" kill "$pid" >/dev/null 2>/dev/null; then continue; fi
+            if _kill_process "\"$sudo\" kill" "$child_pid" "$pid"; then continue; fi
           else
-            if kill "$pid" >/dev/null 2>/dev/null; then continue; fi
+            if _kill_process kill "$child_pid" "$pid"; then continue; fi
           fi
           echo "$line" >> "$monitor_tmpfile"
         fi
@@ -849,10 +865,11 @@ tmon_kill() {
     IFS="|" read -r file title pid tmp dead <<< "$line"
     if [ -n "$dead" ]; then
       if [ $kill == true ]; then
+        child_pid=$(pgrep -P "$pid" || echo "$pid")
         if [ $use_sudo == true ]; then
-          if "$sudo" kill "$pid" >/dev/null 2>/dev/null; then continue; fi
+          if _kill_process "\"$sudo\" kill" "$child_pid" "$pid"; then continue; fi
         else
-          if kill "$pid" >/dev/null 2>/dev/null; then continue; fi
+          if _kill_process kill "$child_pid" "$pid"; then continue; fi
         fi
       fi
       echo "$line" >> "$monitor_tmpfile"
@@ -887,10 +904,11 @@ tmon_kill() {
     if [ $matched == true ]; then
       killed=$kill
       if [ $kill == true -a -n "$pid" ]; then
+        child_pid=$(pgrep -P "$pid" || echo "$pid")
         if [ $use_sudo == true ]; then
-          if "$sudo" kill "$pid" >/dev/null 2>/dev/null; then :; else killed=false; fi
+          if _kill_process "\"$sudo\" kill" "$child_pid" "$pid"; then :; else killed=false; fi
         else
-          if kill "$pid" >/dev/null 2>/dev/null; then :; else killed=false; fi
+          if _kill_process kill "$child_pid" "$pid"; then :; else killed=false; fi
         fi
       fi
       if [ $killed == true -o -z "$pid" ]; then
