@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 sudo=sudo
-tmp_path="/tmp/tmon-$(whoami)"
+tmp_path="/tmp/tmon/$(whoami)"
 
 _abspath() {
   if [ -z "$1" ]; then return; fi
@@ -455,16 +455,19 @@ tmon_monitor() {
       if [ "${#target_files[@]}" -ge "$num_files" ]; then break; fi
     done
   fi
-  
+
+  i=0
   for file_title in "${target_files[@]}"; do
     IFS="|" read -r file title <<< "$file_title"
     if [ -f "$file" ]; then
-      if [ $use_sudo == true ]; then 
-        tmux split-window -v "\"$sudo\" tail -n +0 -f \"${file}\""
+      if [ "$i" -gt 0 ]; then tmux_args="-v"; else tmux_args="-h -p 50"; fi
+      if [ $use_sudo == true ]; then
+        tmux split-window $tmux_args "\"$sudo\" tail -n +0 -f \"${file}\""
       else
         if [ ! -r "$file" ]; then continue; fi
-        tmux split-window -v "tail -n +0 -f \"${file}\""
+        tmux split-window $tmux_args "tail -n +0 -f \"${file}\""
       fi
+      i=$(expr "$i" + 1)
       tmux select-pane -T "$(_get_pane_title "$title")"
     fi
   done
