@@ -918,7 +918,7 @@ _start_session() {
   local session_name="$1"
   
   if [ -z "$session_name" ]; then
-    session_name="tmon_$$_$RANDOM"
+    session_name="tmon$RANDOM"
   fi
   
   # Create detached session
@@ -1448,7 +1448,7 @@ _tmon_session_create() {
   
   # Generate session name if not provided
   if [ -z "$session_name" ]; then
-    session_name="tmon_$$_$RANDOM"
+    session_name="tmon$RANDOM"
   fi
   
   # Check if session already exists
