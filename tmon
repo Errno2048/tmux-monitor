@@ -918,11 +918,15 @@ _start_session() {
   local session_name="$1"
   
   if [ -z "$session_name" ]; then
-    session_name="tmon$RANDOM"
+    session_name="tmon_$$_$RANDOM"
   fi
   
   # Create detached session
   tmux new-session -d -s "$session_name"
+  
+  # Get the actual window_id (e.g., @0, @1)
+  local window_id
+  window_id=$(tmux display-message -t "${session_name}:" -p '#{window_id}' 2>/dev/null)
   
   # Configure session appearance
   tmux set -t "$session_name" status-style "bg=black,fg=green"
@@ -930,7 +934,10 @@ _start_session() {
   tmux set -t "$session_name" pane-border-status top
   tmux set -t "$session_name" mouse on
   
-  echo "${session_name}@0"
+  # Set pane 0 title to empty (not hostname)
+  tmux select-pane -t "${session_name}:${window_id}.0" -T ""
+  
+  echo "${session_name}@${window_id}"
 }
 
 #
@@ -1448,7 +1455,7 @@ _tmon_session_create() {
   
   # Generate session name if not provided
   if [ -z "$session_name" ]; then
-    session_name="tmon$RANDOM"
+    session_name="tmon_$$_$RANDOM"
   fi
   
   # Check if session already exists
@@ -1467,11 +1474,14 @@ _tmon_session_create() {
   
   # Attach unless detach flag is set
   if [ "$detach" != true ]; then
-    # If we're in a session, detach first
+    # If we're in a session, use switch-client to switch to new session
     if [ "$(in_session)" == "1" ]; then
-      tmux detach-client 2>/dev/null
+      local target_session_name
+      target_session_name=$(_get_session_name_from_id "$session_id")
+      tmux switch-client -t "$target_session_name" 2>/dev/null
+    else
+      _attach_session "$session_id"
     fi
-    _attach_session "$session_id"
   fi
 }
 
@@ -1500,12 +1510,14 @@ _tmon_session_attach() {
   # Update session activity
   _register_session "$session_id" "active"
   
-  # If we're in a session, detach first
+  # If we're in a session, use switch-client instead of detach+attach
   if [ "$(in_session)" == "1" ]; then
-    tmux detach-client 2>/dev/null
+    local target_session_name
+    target_session_name=$(_get_session_name_from_id "$session_id")
+    tmux switch-client -t "$target_session_name" 2>/dev/null
+  else
+    _attach_session "$session_id"
   fi
-  
-  _attach_session "$session_id"
 }
 
 #
@@ -1544,6 +1556,21 @@ _tmon_session_switch() {
       return 1
     fi
     
+    # If no current session, we're outside tmux - just attach to target
+    if [ -z "$current_session" ]; then
+      # Check if there's only one session
+      local session_count
+      session_count=$(_list_sessions | wc -l)
+      if [ "$session_count" -eq 1 ]; then
+        echo "No other sessions available." >&2
+        return 1
+      fi
+      # Multiple sessions exist, attach to the first one
+      _register_session "$target_session" "active"
+      _attach_session "$target_session"
+      return 0
+    fi
+    
     if [ "$target_session" == "$current_session" ]; then
       echo "No other sessions available." >&2
       return 1
@@ -1558,12 +1585,19 @@ _tmon_session_switch() {
   # Mark current session as detached if we're in one
   if [ -n "$current_session" ]; then
     _register_session "$current_session" "detached"
-    tmux detach-client 2>/dev/null
   fi
   
   # Activate target session
   _register_session "$target_session" "active"
-  _attach_session "$target_session"
+  
+  # If we're currently in a session, use switch-client
+  if [ -n "$current_session" ]; then
+    local target_session_name
+    target_session_name=$(_get_session_name_from_id "$target_session")
+    tmux switch-client -t "$target_session_name" 2>/dev/null
+  else
+    _attach_session "$target_session"
+  fi
 }
 
 #
