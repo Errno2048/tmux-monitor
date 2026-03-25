@@ -1,14 +1,51 @@
 #!/usr/bin/env bash
-sudo=sudo
-tmp_path="/tmp/tmon/$(whoami)"
+#
+# tmon - tmux-monitor
+# A file and process monitoring tool based on tmux with session isolation support
+#
+# Author: (original author)
+# Modified: 2026-03-24 - Added session management and isolation
+#
 
+# ============================================================================
+# GLOBAL CONFIGURATION
+# ============================================================================
+
+# sudo command to use
+sudo=sudo
+
+# Base temporary directory for tmon
+# Structure: /tmp/tmon/$(whoami)/
+#   - sessions              : Session registry file
+#   - ${SESSION_ID}/        : Per-session directory
+#     - monitor             : Monitor registry for this session
+#     - *.out, *.err        : Temporary output files
+#
+tmp_path="${tmp_path:-/tmp/tmon/$(whoami)}"
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+#
+# _abspath - Convert relative path to absolute path
+# Arguments:
+#   $1 - File path (relative or absolute)
+# Returns:
+#   Absolute path on stdout, or empty string if path is invalid
+#
 _abspath() {
   if [ -z "$1" ]; then return; fi
+  local dirname basename
   dirname=$(cd "$(dirname "$1")" || exit; pwd)
   basename=$(basename "$1")
   echo "$dirname/$basename"
 }
 
+#
+# _prepare_tmp - Ensure base temporary directory exists
+# Creates the base directory structure at $tmp_path
+#
 _prepare_tmp() {
   if [ ! -d "$tmp_path" ]; then
     if [ -e "$tmp_path" ]; then rm -f "$tmp_path"; fi
@@ -16,130 +53,514 @@ _prepare_tmp() {
   fi
 }
 
+#
+# _check_monitor_arg - Check if any argument contains pipe character
+# Arguments:
+#   $@ - Arguments to check
+# Returns:
+#   1 if any argument contains '|', 0 otherwise
+#
 _check_monitor_arg() {
   while [ $# -gt 0 ]; do
-    if [ "$(expr index "$1" :)" -ne 0 ]; then echo 1; fi
+    if echo "$1" | grep -q '|'; then echo 1; return; fi
     shift
   done
   echo 0
 }
 
+#
+# _escape_monitor_arg - Escape pipe characters in string
+# Arguments:
+#   $1 - String to escape
+# Returns:
+#   String with '|' replaced by space
+#
 _escape_monitor_arg() {
   echo "$1" | sed "s/|/ /g"
 }
 
-_get_monitor_file() {
-  echo "$tmp_path/monitor"
+# ============================================================================
+# SESSION MANAGEMENT
+# ============================================================================
+#
+# Session ID format: ${session_name}@${window_id}
+# Example: "tmon_12345@0", "my_session@1"
+#
+# Session Registry Format (pipe-delimited):
+#   SESSION_ID|CREATION_TIME|LAST_ACTIVITY|STATUS
+#
+
+#
+# _get_sessions_file - Get path to sessions registry file
+# Returns:
+#   Path to sessions registry file
+#
+_get_sessions_file() {
+  echo "${tmp_path}/sessions"
 }
 
-_monitor_file_check() {
+#
+# _init_sessions_registry - Initialize sessions registry file
+# Creates empty sessions file if it doesn't exist
+#
+_init_sessions_registry() {
   _prepare_tmp
-  monitor_file=$(_get_monitor_file)
-  monitor_tmpfile="${monitor_file}.tmp"
-  if [ ! -f "$monitor_file" ]; then
-    if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
-  else
-    if [ -f "$monitor_tmpfile" ]; then rm -f "$monitor_tmpfile"; fi
+  local sessions_file
+  sessions_file=$(_get_sessions_file)
+  if [ ! -f "$sessions_file" ]; then
+    touch "$sessions_file"
   fi
-  num_lines=0
-  while IFS= read -r line; do
-    if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then continue; fi
-    IFS="|" read -r file title pid tmp dead <<< "$line"
-    if [ -z "$pid" ]; then
-      echo "$line"
-      num_lines=$(expr $num_lines + 1)
+}
+
+#
+# _get_current_session_id - Get session ID of current tmux session
+# Returns:
+#   Session ID in format "name@window_id", or empty if not in tmux
+#
+_get_current_session_id() {
+  # Check if we're inside tmux
+  if [ -z "$TMUX" ]; then
+    echo ""
+    return
+  fi
+  
+  local session_name window_id
+  session_name=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+  window_id=$(tmux display-message -p '#{window_id}' 2>/dev/null)
+  
+  if [ -n "$session_name" ] && [ -n "$window_id" ]; then
+    echo "${session_name}@${window_id}"
+  else
+    echo ""
+  fi
+}
+
+#
+# _get_session_name_from_id - Extract session name from session ID
+# Arguments:
+#   $1 - Session ID (format: name@window_id)
+# Returns:
+#   Session name (part before @)
+#
+_get_session_name_from_id() {
+  echo "$1" | cut -d'@' -f1
+}
+
+#
+# _get_window_id_from_id - Extract window ID from session ID
+# Arguments:
+#   $1 - Session ID (format: name@window_id)
+# Returns:
+#   Window ID (part after @)
+#
+_get_window_id_from_id() {
+  echo "$1" | cut -d'@' -f2
+}
+
+#
+# _session_exists_in_tmux - Check if a tmux session exists
+# Arguments:
+#   $1 - Session ID or session name
+# Returns:
+#   0 if session exists, 1 otherwise
+#
+_session_exists_in_tmux() {
+  local session_id="$1"
+  if [ -z "$session_id" ]; then return 1; fi
+  
+  local session_name
+  session_name=$(_get_session_name_from_id "$session_id")
+  
+  tmux has-session -t "$session_name" 2>/dev/null
+}
+
+#
+# _is_session_attached - Check if a tmux session is currently attached
+# Arguments:
+#   $1 - Session name
+# Returns:
+#   0 if attached, 1 if detached or session doesn't exist
+#
+_is_session_attached() {
+  local session_name="$1"
+  if [ -z "$session_name" ]; then return 1; fi
+  
+  local attached
+  attached=$(tmux display-message -t "${session_name}:" -p '#{session_attached}' 2>/dev/null)
+  
+  if [ "$attached" == "1" ]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+#
+# _cleanup_dead_sessions - Remove dead sessions from registry
+# Scans sessions registry and removes entries for sessions that no longer exist in tmux
+# Also cleans up associated temporary directories
+#
+_cleanup_dead_sessions() {
+  local sessions_file tmp_file
+  sessions_file=$(_get_sessions_file)
+  tmp_file="${sessions_file}.tmp"
+  
+  if [ ! -f "$sessions_file" ]; then return; fi
+  
+  > "$tmp_file"
+  while IFS='|' read -r reg_session_id creation_time last_activity status; do
+    if [ -z "$reg_session_id" ]; then continue; fi
+    
+    # Extract just the session name (before @) for tmux check
+    local session_name
+    session_name=$(echo "$reg_session_id" | cut -d'@' -f1)
+    
+    if tmux has-session -t "$session_name" 2>/dev/null; then
+      # Session still alive, keep in registry
+      echo "${reg_session_id}|${creation_time}|${last_activity}|${status}" >> "$tmp_file"
     else
-      if kill -0 "$pid" 2>/dev/null; then
-        echo "$line"
-        num_lines=$(expr $num_lines + 1)
-      else
-        if [ -n "$tmp" ]; then
-          tmp_stdout=$(_get_tmp_stdout "$tmp")
-          if [ -f "$tmp_stdout" ]; then rm -f "$tmp_stdout"; fi
-          tmp_stderr=$(_get_tmp_stderr "$tmp")
-          if [ -f "$tmp_stderr" ]; then rm -f "$tmp_stderr"; fi
-        fi
+      # Session is dead, clean up its directory
+      local session_dir="${tmp_path}/${reg_session_id}"
+      if [ -d "$session_dir" ]; then
+        rm -rf "$session_dir"
       fi
     fi
-  done < <(cat "$monitor_file" 2>/dev/null; echo) >> "$monitor_tmpfile"
-  if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
-}
-
-_monitor_append() {
-  _prepare_tmp
-  monitor_file=$(_get_monitor_file)
-  if [ ! -f "$monitor_file" ]; then touch "$monitor_file"; fi
-  if [ "$(_check_monitor_arg "$@")" -ne 0 ]; then return; fi
-  (IFS="|"; echo "$*" >> "$monitor_file")
-}
-
-_monitor_clear() {
-  monitor_file=$(_get_monitor_file)
-  if [ ! -f "$monitor_file" ]; then
-    if [ -d "$tmp_path" ]; then
-      rm -r "$tmp_path"
+  done < "$sessions_file"
+  
+  if [ -s "$tmp_file" ]; then
+    mv -f "$tmp_file" "$sessions_file"
+  elif [ -f "$tmp_file" ]; then
+    rm -f "$tmp_file"
+    # If tmp_file is empty but original exists, clear original (all sessions dead)
+    if [ -f "$sessions_file" ]; then
+      : > "$sessions_file"
     fi
-  else
-    preserved=()
-    preserved_tmp=()
-    while IFS= read -r line; do
-      if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then continue; fi
-      IFS="|" read -r file title pid tmp dead <<< "$line"
-      if [ -n "$pid" ]; then
-        if kill -0 "$pid" 2>/dev/null; then
-          preserved=("${preserved[@]}" "$file|$title|$pid|$tmp|dead")
-          preserved_tmp=("${preserved_tmp[@]}" "$(basename "$(_get_tmp_stdout $tmp)")" "$(basename "$(_get_tmp_stderr $tmp)")")
-        fi
-      fi
-    done < <(cat "$monitor_file" 2>/dev/null; echo)
-    find "$tmp_path" -mindepth 1 -maxdepth 1 | while read -r file; do
-      if [ -d "$file" ]; then
-        rm -rf "$file"
-      else
-        file_base="$(basename "$file")"
-        found=false
-        for preserved_file in "${preserved_tmp[@]}"; do
-          if [ "$file_base" == "$preserved_file" ]; then found=true; break; fi
-        done
-        if [ "$found" == true ]; then :; else
-          rm -f "$file"
-        fi
-      fi
-    done
-    for line in "${preserved[@]}"; do
-      echo "$line" >> "$monitor_file"
-    done
   fi
 }
 
-_get_monitored_files() {
-  monitor_file=$(_get_monitor_file)
-  if [ ! -f "$monitor_file" ]; then return; fi
-  _monitor_file_check
-  (cat "$monitor_file" 2>/dev/null && echo) | while IFS= read -r line || [ -n "$line" ]; do
-    if [ -n "$line" ]; then echo "$line"; fi
-  done
+#
+# _register_session - Register a new session or update existing one
+# Arguments:
+#   $1 - Session ID
+#   $2 - Status (active|detached, default: active)
+#
+_register_session() {
+  local session_id="$1"
+  local status="${2:-active}"
+  
+  if [ -z "$session_id" ]; then return; fi
+  
+  _init_sessions_registry
+  _cleanup_dead_sessions
+  
+  local sessions_file tmp_file current_time
+  sessions_file=$(_get_sessions_file)
+  tmp_file="${sessions_file}.tmp"
+  current_time=$(date +%s)
+  
+  > "$tmp_file"
+  local found=false
+  while IFS='|' read -r reg_session_id creation_time last_activity reg_status; do
+    if [ -z "$reg_session_id" ]; then continue; fi
+    
+    if [ "$reg_session_id" == "$session_id" ]; then
+      # Update existing session
+      echo "${session_id}|${creation_time}|${current_time}|${status}" >> "$tmp_file"
+      found=true
+    else
+      # Keep other sessions unchanged
+      echo "${reg_session_id}|${creation_time}|${last_activity}|${reg_status}" >> "$tmp_file"
+    fi
+  done < "$sessions_file"
+  
+  # Add new session if not found
+  if [ "$found" == false ]; then
+    echo "${session_id}|${current_time}|${current_time}|${status}" >> "$tmp_file"
+  fi
+  
+  mv -f "$tmp_file" "$sessions_file"
 }
 
-_get_tmp_stdout() {
-  if [ -z "$1" ]; then return; fi
-  echo "${tmp_path}/$1.out"
+#
+# _unregister_session - Remove a session from registry
+# Arguments:
+#   $1 - Session ID
+#
+_unregister_session() {
+  local session_id="$1"
+  if [ -z "$session_id" ]; then return; fi
+  
+  local sessions_file tmp_file
+  sessions_file=$(_get_sessions_file)
+  tmp_file="${sessions_file}.tmp"
+  
+  if [ ! -f "$sessions_file" ]; then return; fi
+  
+  > "$tmp_file"
+  while IFS='|' read -r reg_session_id creation_time last_activity reg_status; do
+    if [ -z "$reg_session_id" ]; then continue; fi
+    if [ "$reg_session_id" != "$session_id" ]; then
+      echo "${reg_session_id}|${creation_time}|${last_activity}|${reg_status}" >> "$tmp_file"
+    fi
+  done < "$sessions_file"
+  
+  mv -f "$tmp_file" "$sessions_file"
+  
+  # Clean up session directory
+  local session_dir="${tmp_path}/${session_id}"
+  if [ -d "$session_dir" ]; then
+    rm -rf "$session_dir"
+  fi
 }
 
-_get_tmp_stderr() {
-  if [ -z "$1" ]; then return; fi
-  echo "${tmp_path}/$1.err"
+#
+# _get_latest_session - Get the most recently active session ID
+# Returns:
+#   Session ID of latest session, or empty if no sessions exist
+#
+_get_latest_session() {
+  _init_sessions_registry
+  _cleanup_dead_sessions
+  
+  local sessions_file
+  sessions_file=$(_get_sessions_file)
+  
+  if [ ! -s "$sessions_file" ]; then
+    echo ""
+    return
+  fi
+  
+  # Sort by last_activity (field 3) in descending order and get the first
+  sort -t'|' -k3 -nr "$sessions_file" 2>/dev/null | head -1 | cut -d'|' -f1
 }
 
-_get_tmp_index() {
+#
+# _get_next_session - Get next session in creation order (for cycling)
+# Arguments:
+#   $1 - Current session ID
+# Returns:
+#   Next session ID in creation order, or first session if current is last
+#
+_get_next_session() {
+  local current_session="$1"
+  
+  _init_sessions_registry
+  _cleanup_dead_sessions
+  
+  local sessions_file
+  sessions_file=$(_get_sessions_file)
+  
+  if [ ! -s "$sessions_file" ]; then
+    echo ""
+    return
+  fi
+  
+  # Get list of sessions sorted by creation time
+  local sessions
+  sessions=$(sort -t'|' -k2 -n "$sessions_file" 2>/dev/null | cut -d'|' -f1)
+  
+  if [ -z "$current_session" ]; then
+    # No current session, return the first one
+    echo "$sessions" | head -1
+    return
+  fi
+  
+  # Find current session and return next one
+  local found=false
+  local next_session=""
+  while IFS= read -r session_id; do
+    if [ "$found" == true ]; then
+      next_session="$session_id"
+      break
+    fi
+    if [ "$session_id" == "$current_session" ]; then
+      found=true
+    fi
+  done <<< "$sessions"
+  
+  # If we reached the end, wrap around to first session
+  if [ -z "$next_session" ]; then
+    next_session=$(echo "$sessions" | head -1)
+  fi
+  
+  echo "$next_session"
+}
+
+#
+# _list_sessions - List all active sessions
+# Output format: one session ID per line
+#
+_list_sessions() {
+  _init_sessions_registry
+  _cleanup_dead_sessions
+  
+  local sessions_file
+  sessions_file=$(_get_sessions_file)
+  
+  if [ ! -s "$sessions_file" ]; then
+    return
+  fi
+  
+  cut -d'|' -f1 "$sessions_file"
+}
+
+#
+# _list_sessions_detailed - List all sessions with detailed info
+# Output format: SESSION_ID|CREATION_TIME|LAST_ACTIVITY|STATUS|ATTACHED
+#
+_list_sessions_detailed() {
+  _init_sessions_registry
+  _cleanup_dead_sessions
+  
+  local sessions_file
+  sessions_file=$(_get_sessions_file)
+  
+  if [ ! -s "$sessions_file" ]; then
+    return
+  fi
+  
+  while IFS='|' read -r session_id creation_time last_activity status; do
+    if [ -n "$session_id" ]; then
+      local session_name attached
+      session_name=$(_get_session_name_from_id "$session_id")
+      if _is_session_attached "$session_name"; then
+        attached="attached"
+      else
+        attached="detached"
+      fi
+      echo "${session_id}|${creation_time}|${last_activity}|${status}|${attached}"
+    fi
+  done < "$sessions_file"
+}
+
+# ============================================================================
+# SESSION-AWARE PATH FUNCTIONS
+# ============================================================================
+
+#
+# _get_session_tmp_dir - Get temporary directory for a session
+# Arguments:
+#   $1 - Session ID
+# Returns:
+#   Path to session's temporary directory
+#
+_get_session_tmp_dir() {
+  local session_id="$1"
+  if [ -z "$session_id" ]; then
+    echo "$tmp_path"
+  else
+    echo "${tmp_path}/${session_id}"
+  fi
+}
+
+#
+# _get_monitor_file - Get monitor registry file path for a session
+# Arguments:
+#   $1 - Session ID (optional, defaults to legacy global path)
+# Returns:
+#   Path to monitor file
+#
+_get_monitor_file() {
+  local session_id="$1"
+  if [ -z "$session_id" ]; then
+    # Fallback to legacy global monitor file
+    echo "${tmp_path}/monitor"
+  else
+    echo "${tmp_path}/${session_id}/monitor"
+  fi
+}
+
+#
+# _prepare_session_tmp - Ensure session temporary directory exists
+# Arguments:
+#   $1 - Session ID
+#
+_prepare_session_tmp() {
+  local session_id="$1"
   _prepare_tmp
-  loop_times=0
+  
+  if [ -n "$session_id" ]; then
+    local session_dir
+    session_dir=$(_get_session_tmp_dir "$session_id")
+    if [ ! -d "$session_dir" ]; then
+      mkdir -p "$session_dir"
+    fi
+  fi
+}
+
+#
+# _get_tmp_stdout - Get stdout temp file path
+# Arguments:
+#   $1 - Temporary index
+#   $2 - Session ID (optional)
+#
+_get_tmp_stdout() {
+  local tmp_index="$1"
+  local session_id="$2"
+  
+  if [ -z "$tmp_index" ]; then return; fi
+  
+  local base_dir
+  if [ -n "$session_id" ]; then
+    base_dir=$(_get_session_tmp_dir "$session_id")
+  else
+    base_dir="$tmp_path"
+  fi
+  
+  echo "${base_dir}/${tmp_index}.out"
+}
+
+#
+# _get_tmp_stderr - Get stderr temp file path
+# Arguments:
+#   $1 - Temporary index
+#   $2 - Session ID (optional)
+#
+_get_tmp_stderr() {
+  local tmp_index="$1"
+  local session_id="$2"
+  
+  if [ -z "$tmp_index" ]; then return; fi
+  
+  local base_dir
+  if [ -n "$session_id" ]; then
+    base_dir=$(_get_session_tmp_dir "$session_id")
+  else
+    base_dir="$tmp_path"
+  fi
+  
+  echo "${base_dir}/${tmp_index}.err"
+}
+
+#
+# _get_tmp_index - Generate unique temporary file index
+# Arguments:
+#   $1 - Session ID (optional, for session-scoped indexes)
+# Returns:
+#   Unique index number
+#
+_get_tmp_index() {
+  local session_id="$1"
+  local base_dir
+  
+  _prepare_tmp
+  
+  if [ -n "$session_id" ]; then
+    _prepare_session_tmp "$session_id"
+    base_dir=$(_get_session_tmp_dir "$session_id")
+  else
+    base_dir="$tmp_path"
+  fi
+  
+  local loop_times=0
   while [ $loop_times -lt 32768 ]; do
+    local base_index init_index tmp_index
     base_index=$(expr $loop_times \* 32768)
     init_index=$RANDOM
     tmp_index=$(expr "$(expr "$(expr $init_index + 1)" % 32768)" + $base_index)
-    while [ ! $tmp_index == $init_index ]; do
-      if [ ! -e "$(_get_tmp_stdout "$tmp_index")" -a ! -e "$(_get_tmp_stderr "$tmp_index")" ]; then
+    
+    while [ ! "$tmp_index" = "$init_index" ]; do
+      if [ ! -e "${base_dir}/${tmp_index}.out" -a ! -e "${base_dir}/${tmp_index}.err" ]; then
         echo "$tmp_index"
         return
       fi
@@ -147,89 +568,719 @@ _get_tmp_index() {
     done
     loop_times=$(expr $loop_times + 1)
   done
-  echo ""; return
+  
+  echo ""
 }
 
-_start_session() {
-  tmux new -d
-  tmux set status-style "bg=black,fg=green"
-  tmux set pane-border-format "#{pane_title}"
-  tmux set pane-border-status top
-  tmux set mouse on
-}
 
-_get_window_width() {
-  echo "$(tmux display-message -p "#{window_width}" 2>/dev/null)"
-}
+# ============================================================================
+# MONITOR MANAGEMENT (SESSION-AWARE)
+# ============================================================================
 
-_set_layout() {
-  tmux select-layout main-vertical
-  tmux select-pane -t 0
-  tmux select-pane -T ""
-  tmux resize-pane -x 50% 2>/dev/null
-  if [ $? -ne 0 ]; then
-    width=$(_get_window_width)
-    if [ -n "$width" ]; then tmux resize-pane -x "$(expr "${width}" / 2)"; fi
+#
+# _monitor_file_check - Validate and clean up monitor registry
+# Removes dead monitors (processes that no longer exist)
+# Arguments:
+#   $1 - Session ID (optional)
+#
+_monitor_file_check() {
+  local session_id="${1:-}"
+  local monitor_file monitor_tmpfile
+  
+  _prepare_session_tmp "$session_id"
+  monitor_file=$(_get_monitor_file "$session_id")
+  monitor_tmpfile="${monitor_file}.tmp"
+  
+  # Initialize monitor file if needed
+  if [ ! -f "$monitor_file" ]; then
+    touch "$monitor_file"
+    return
   fi
-}
-
-_is_attached() {
-  if [ -z "$1" ]; then
-    sessionid=$(tmux display -p '#S') || sessionid=-1
-    if [ ${sessionid} == -1 ]; then return 0; fi
+  
+  # Remove stale tmpfile if exists
+  rm -f "$monitor_tmpfile"
+  
+  # Check each monitor entry and clean up dead ones
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$line" ]; then continue; fi
+    
+    local file title pid tmp dead
+    IFS="|" read -r file title pid tmp dead <<< "$line"
+    
+    if [ -z "$pid" ]; then
+      # No PID associated, keep it
+      echo "$line" >> "$monitor_tmpfile"
+    else
+      # Check if process is still alive
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "$line" >> "$monitor_tmpfile"
+      else
+        # Process dead, clean up temp files
+        if [ -n "$tmp" ]; then
+          local tmp_stdout tmp_stderr
+          tmp_stdout=$(_get_tmp_stdout "$tmp" "$session_id")
+          tmp_stderr=$(_get_tmp_stderr "$tmp" "$session_id")
+          rm -f "$tmp_stdout" "$tmp_stderr"
+        fi
+      fi
+    fi
+  done < "$monitor_file"
+  
+  # Replace original file with cleaned version
+  if [ -f "$monitor_tmpfile" ]; then
+    mv -f "$monitor_tmpfile" "$monitor_file"
   else
-    sessionid=$1
+    # All entries were dead, create empty file
+    : > "$monitor_file"
   fi
-  attached=$(tmux ls -F '#{session_attached}@#{session_name}' | grep "@${sessionid}" | sed 's/@[0-9]*//g')
-  if [ "$attached" == 1 ]; then return 1; fi
-  return 0
 }
 
-is_attached() {
-  _is_attached "$@" 2>/dev/null
-  echo $?
+#
+# _monitor_append - Append a monitor entry to registry
+# Arguments:
+#   $1 - File path
+#   $2 - Title
+#   $3 - PID
+#   $4 - Temp index
+#   $5 - Dead flag
+#   $6 - Session ID (optional)
+#
+_monitor_append() {
+  local session_id="${6:-}"
+  local monitor_file
+  
+  _prepare_session_tmp "$session_id"
+  monitor_file=$(_get_monitor_file "$session_id")
+  
+  if [ ! -f "$monitor_file" ]; then
+    touch "$monitor_file"
+  fi
+  
+  # Check for pipe characters in arguments
+  if [ "$(_check_monitor_arg "$@")" -ne 0 ]; then return; fi
+  
+  (IFS="|"; echo "$1|$2|$3|$4|$5" >> "$monitor_file")
 }
 
+#
+# _monitor_clear - Clear all monitors for a session
+# Optionally preserves monitors with running processes
+# Arguments:
+#   $1 - Session ID (optional)
+#
+_monitor_clear() {
+  local session_id="${1:-}"
+  local monitor_file
+  
+  monitor_file=$(_get_monitor_file "$session_id")
+  
+  if [ ! -f "$monitor_file" ]; then
+    # Clean up empty session directory
+    if [ -n "$session_id" ]; then
+      local session_dir
+      session_dir=$(_get_session_tmp_dir "$session_id")
+      if [ -d "$session_dir" ]; then
+        rm -rf "$session_dir"
+      fi
+    fi
+    return
+  fi
+  
+  # Collect monitors with running processes
+  local preserved=()
+  local preserved_tmp=()
+  
+  while IFS= read -r line; do
+    if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then continue; fi
+    
+    local file title pid tmp dead
+    IFS="|" read -r file title pid tmp dead <<< "$line"
+    
+    if [ -n "$pid" ]; then
+      if kill -0 "$pid" 2>/dev/null; then
+        preserved=("${preserved[@]}" "$file|$title|$pid|$tmp|dead")
+        if [ -n "$tmp" ]; then
+          local tmp_stdout tmp_stderr
+          tmp_stdout=$(_get_tmp_stdout "$tmp" "$session_id")
+          tmp_stderr=$(_get_tmp_stderr "$tmp" "$session_id")
+          preserved_tmp=("${preserved_tmp[@]}" "$(basename "$tmp_stdout")" "$(basename "$tmp_stderr")")
+        fi
+      fi
+    fi
+  done < <(cat "$monitor_file" 2>/dev/null; echo)
+  
+  # Clean up temp files not preserved
+  local session_dir
+  session_dir=$(_get_session_tmp_dir "$session_id")
+  
+  find "$session_dir" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | while read -r file; do
+    local file_base found
+    file_base="$(basename "$file")"
+    found=false
+    
+    for preserved_file in "${preserved_tmp[@]}"; do
+      if [ "$file_base" == "$preserved_file" ]; then
+        found=true
+        break
+      fi
+    done
+    
+    if [ "$found" != true ]; then
+      rm -f "$file"
+    fi
+  done
+  
+  # Write preserved monitors back
+  > "$monitor_file"
+  for line in "${preserved[@]}"; do
+    echo "$line" >> "$monitor_file"
+  done
+}
+
+#
+# _get_monitored_files - Get all monitored files for a session
+# Arguments:
+#   $1 - Session ID (optional)
+# Output: One monitor record per line (pipe-delimited)
+#
+_get_monitored_files() {
+  local session_id="${1:-}"
+  local monitor_file
+  
+  monitor_file=$(_get_monitor_file "$session_id")
+  
+  if [ ! -f "$monitor_file" ]; then
+    return
+  fi
+  
+  _monitor_file_check "$session_id"
+  
+  (cat "$monitor_file" 2>/dev/null && echo) | while IFS= read -r line || [ -n "$line" ]; do
+    if [ -n "$line" ]; then
+      # Skip dead entries (entries with dead flag set)
+      local dead_flag
+      dead_flag=$(echo "$line" | awk -F'|' '{print $5}')
+      if [ -z "$dead_flag" ]; then
+        echo "$line"
+      fi
+    fi
+  done
+}
+
+# ============================================================================
+# SESSION RESOLUTION HELPERS
+# ============================================================================
+
+#
+# _resolve_session_open - Resolve session for open/exec/monitor commands
+# Rules:
+#   - If -S specified: use that session (create if needed)
+#   - If inside tmux: use current session
+#   - Otherwise: use latest session (don't attach here, caller handles it)
+# Arguments:
+#   $1 - Specified session ID (may be empty)
+#   $2 - Whether to create new session if none exists (true/false)
+# Returns:
+#   Session ID on stdout (with "CREATED:" prefix if new session was created),
+#   or empty if resolution failed
+#
+_resolve_session_open() {
+  local specified_session="$1"
+  local create_if_needed="${2:-true}"
+  
+  if [ -n "$specified_session" ]; then
+    # User specified a session
+    if _session_exists_in_tmux "$specified_session"; then
+      echo "$specified_session"
+      return
+    elif [ "$create_if_needed" == true ]; then
+      # Create new session with specified ID using _start_session for proper styling
+      local session_name session_id
+      session_name=$(_get_session_name_from_id "$specified_session")
+      session_id=$(_start_session "$session_name")
+      if [ -n "$session_id" ]; then
+        echo "CREATED:${session_id}"
+        return
+      fi
+    fi
+    echo ""
+    return
+  fi
+  
+  # Check if we're inside tmux
+  local current_session
+  current_session=$(_get_current_session_id)
+  
+  if [ -n "$current_session" ]; then
+    # Use current session
+    echo "$current_session"
+    return
+  fi
+  
+  # Not in tmux, try to use latest session (don't attach here - caller will handle)
+  local latest_session
+  latest_session=$(_get_latest_session)
+  
+  if [ -n "$latest_session" ]; then
+    # Return the session ID - caller will attach if needed
+    echo "$latest_session"
+    return
+  fi
+  
+  # No sessions exist, create new one if allowed
+  if [ "$create_if_needed" == true ]; then
+    local session_id
+    session_id=$(_start_session)
+    if [ -n "$session_id" ]; then
+      echo "CREATED:${session_id}"
+      return
+    fi
+  fi
+  
+  echo ""
+}
+
+#
+# _resolve_session_kill_clear - Resolve session for kill/clear commands
+# Rules:
+#   - If -S specified: use that session
+#   - If inside tmux: use current session
+#   - Otherwise: use latest session
+#   - Never create new session
+# Arguments:
+#   $1 - Specified session ID (may be empty)
+# Returns:
+#   Session ID on stdout, or empty if no session found
+#
+_resolve_session_kill_clear() {
+  local specified_session="$1"
+  
+  if [ -n "$specified_session" ]; then
+    if _session_exists_in_tmux "$specified_session"; then
+      echo "$specified_session"
+    else
+      echo ""
+    fi
+    return
+  fi
+  
+  # Check if we're inside tmux
+  local current_session
+  current_session=$(_get_current_session_id)
+  
+  if [ -n "$current_session" ]; then
+    echo "$current_session"
+    return
+  fi
+  
+  # Use latest session
+  _get_latest_session
+}
+
+#
+# _resolve_session_ps - Resolve session for ps command
+# Rules:
+#   - If -S specified: use that session only
+#   - Otherwise: all sessions (return empty string to indicate "all")
+# Arguments:
+#   $1 - Specified session ID (may be empty)
+# Returns:
+#   Session ID, or empty to indicate "all sessions"
+#
+_resolve_session_ps() {
+  local specified_session="$1"
+  
+  if [ -n "$specified_session" ]; then
+    if _session_exists_in_tmux "$specified_session"; then
+      echo "$specified_session"
+    else
+      echo ""
+    fi
+    return
+  fi
+  
+  # Empty means "all sessions"
+  echo ""
+}
+
+# ============================================================================
+# TMUX SESSION OPERATIONS
+# ============================================================================
+
+#
+# _start_session - Create a new tmux session
+# Arguments:
+#   $1 - Session name (optional, auto-generated if not provided)
+# Returns:
+#   Session ID on stdout
+#
+_start_session() {
+  local session_name="$1"
+  
+  if [ -z "$session_name" ]; then
+    session_name="tmon_$$_$RANDOM"
+  fi
+  
+  # Create detached session
+  tmux new-session -d -s "$session_name"
+  
+  # Configure session appearance
+  tmux set -t "$session_name" status-style "bg=black,fg=green"
+  tmux set -t "$session_name" pane-border-format "#{pane_title}"
+  tmux set -t "$session_name" pane-border-status top
+  tmux set -t "$session_name" mouse on
+  
+  echo "${session_name}@0"
+}
+
+#
+# _attach_session - Attach to a tmux session
+# Arguments:
+#   $1 - Session ID
+# Returns:
+#   0 on success, 1 on failure
+#
+_attach_session() {
+  local session_id="$1"
+  local session_name
+  
+  session_name=$(_get_session_name_from_id "$session_id")
+  tmux attach-session -t "$session_name" 2>/dev/null
+}
+
+#
+# _detach_session - Detach from a tmux session
+# Arguments:
+#   $1 - Session ID (optional, uses current if not specified)
+#
+_detach_session() {
+  local session_id="$1"
+  local session_name
+  
+  if [ -n "$session_id" ]; then
+    session_name=$(_get_session_name_from_id "$session_id")
+    tmux detach-client -s "$session_name" 2>/dev/null
+  else
+    tmux detach-client 2>/dev/null
+  fi
+}
+
+#
+# _kill_session - Kill a tmux session
+# Arguments:
+#   $1 - Session ID
+#
+_kill_session() {
+  local session_id="$1"
+  local session_name
+  
+  if [ -z "$session_id" ]; then return; fi
+  
+  session_name=$(_get_session_name_from_id "$session_id")
+  tmux kill-session -t "$session_name" 2>/dev/null
+  
+  # Clean up registry
+  _unregister_session "$session_id"
+}
+
+# ============================================================================
+# TMUX PANE OPERATIONS (SESSION-AWARE)
+# ============================================================================
+
+#
+# _get_window_width - Get window width for a session
+# Arguments:
+#   $1 - Session ID
+#
+_get_window_width() {
+  local session_id="$1"
+  local session_name
+  
+  session_name=$(_get_session_name_from_id "$session_id")
+  tmux display-message -t "${session_name}:" -p '#{window_width}' 2>/dev/null
+}
+
+#
+# _set_layout - Set pane layout for a session
+# Arguments:
+#   $1 - Session ID
+#
+_set_layout() {
+  local session_id="$1"
+  local session_name window_id
+  
+  session_name=$(_get_session_name_from_id "$session_id")
+  window_id=$(_get_window_id_from_id "$session_id")
+  
+  # Select main-vertical layout
+  tmux select-layout -t "${session_name}:${window_id}" main-vertical
+  
+  # Select pane 0 and clear its title (pane 0 should have empty title)
+  tmux select-pane -t "${session_name}:${window_id}.0"
+  tmux select-pane -t "${session_name}:${window_id}.0" -T ""
+  
+  # Resize pane 0 to 50% width
+  tmux resize-pane -t "${session_name}:${window_id}.0" -x 50% 2>/dev/null
+  
+  if [ $? -ne 0 ]; then
+    local width
+    width=$(_get_window_width "$session_id")
+    if [ -n "$width" ]; then
+      tmux resize-pane -t "${session_name}:${window_id}.0" -x "$(expr "${width}" / 2)"
+    fi
+  fi
+  
+  # Ensure pane 0 is the active pane after layout
+  tmux select-pane -t "${session_name}:${window_id}.0"
+}
+
+#
+# _find_panes_by_title - Find pane IDs by title pattern
+# Arguments:
+#   $1 - Title pattern to search for
+#   $2 - Session ID
+# Returns:
+#   Pane IDs (one per line) that match the pattern
+#
+_find_panes_by_title() {
+  local title_pattern="$1"
+  local session_id="$2"
+  local session_name
+  
+  if [ -z "$title_pattern" ]; then return; fi
+  
+  session_name=$(_get_session_name_from_id "$session_id")
+  tmux list-panes -t "${session_name}:" -F "#P:#T" 2>/dev/null | \
+    grep -E "^[0-9]+:.*?${title_pattern}.*$" | \
+    sed "s/:.*//g"
+}
+
+#
+# _kill_pane - Kill a specific pane in a session
+# Arguments:
+#   $1 - Pane index
+#   $2 - Session ID
+#
+_kill_pane() {
+  local pane_index="$1"
+  local session_id="$2"
+  local session_name window_id
+  
+  session_name=$(_get_session_name_from_id "$session_id")
+  window_id=$(_get_window_id_from_id "$session_id")
+  # Target format: session:window.pane (e.g., mysession:0.1 for window 0, pane 1)
+  tmux kill-pane -t "${session_name}:${window_id}.${pane_index}" 2>/dev/null
+}
+
+#
+# _kill_all_panes_except_first - Kill all panes except pane 0
+# Arguments:
+#   $1 - Session ID
+#
+_kill_all_panes_except_first() {
+  local session_id="$1"
+  local session_name window_id
+  
+  session_name=$(_get_session_name_from_id "$session_id")
+  window_id=$(_get_window_id_from_id "$session_id")
+  
+  # First swap current pane to 0 if needed
+  local current_pane_id
+  current_pane_id=$(_current_pane "$session_id")
+  if [ "$current_pane_id" != "0" ] && [ "$current_pane_id" != "-1" ]; then
+    tmux swap-pane -U -t "${session_name}:${window_id}" 2>/dev/null
+  fi
+  
+  # Kill all panes except 0
+  tmux kill-pane -a -t "${session_name}:${window_id}.0" 2>/dev/null
+}
+
+#
+# _split_window - Split window to create a new pane
+# Arguments:
+#   $1 - Split arguments (e.g., "-v" or "-h -p 50")
+#   $2 - Command to run in new pane
+#   $3 - Session ID
+# Returns:
+#   The index of the newly created pane
+#
+_split_window() {
+  local split_args="$1"
+  local command="$2"
+  local session_id="$3"
+  local session_name
+  
+  session_name=$(_get_session_name_from_id "$session_id")
+  
+  # Split the window and capture the new pane index
+  # Use -P to print the pane_id, then convert to index
+  local new_pane_id
+  new_pane_id=$(tmux split-window -t "${session_name}:" -P -F "#{pane_id}" $split_args "$command")
+  
+  # Get the pane index from the pane_id
+  local new_pane_index
+  new_pane_index=$(tmux list-panes -t "${session_name}:" -F "#{pane_index}@#{pane_id}" | grep "@${new_pane_id}$" | cut -d'@' -f1)
+  
+  echo "$new_pane_index"
+}
+
+#
+# _select_pane - Select a pane and optionally set its title
+# Arguments:
+#   $1 - Pane index
+#   $2 - Session ID
+#   $3 - Title (optional)
+#
+_select_pane() {
+  local pane_index="$1"
+  local session_id="$2"
+  local title="${3:-}"
+  local session_name window_id
+  
+  session_name=$(_get_session_name_from_id "$session_id")
+  window_id=$(_get_window_id_from_id "$session_id")
+  
+  # Target format: session:window.pane (e.g., mysession:0.1 for window 0, pane 1)
+  if [ -n "$title" ]; then
+    tmux select-pane -t "${session_name}:${window_id}.${pane_index}" -T "$title"
+  else
+    tmux select-pane -t "${session_name}:${window_id}.${pane_index}"
+  fi
+}
+
+#
+# _current_pane - Get current pane ID in a session
+# Arguments:
+#   $1 - Session ID (optional, uses current if not specified)
+# Returns:
+#   Pane ID, or -1 if not in tmux
+#
+_current_pane() {
+  local session_id="$1"
+  
+  if [ -n "$session_id" ]; then
+    local session_name
+    session_name=$(_get_session_name_from_id "$session_id")
+    tmux display-message -t "${session_name}:" -p '#{pane_index}' 2>/dev/null
+  else
+    if [ -z "$TMUX_PANE" ]; then
+      echo -1
+    else
+      tmux list-panes -F "#P@#D" | grep "@$TMUX_PANE" | sed "s/@$TMUX_PANE//g"
+    fi
+  fi
+}
+
+# ============================================================================
+# LEGACY COMPATIBILITY FUNCTIONS
+# ============================================================================
+
+#
+# in_session - Check if we're inside a tmux session
+# Returns:
+#   1 if inside tmux, 0 otherwise
+#
 in_session() {
   if [ -n "$TMUX" ]; then echo 1; else echo 0; fi
 }
 
-exit_session() {
-  _is_attached 2>/dev/null
-  if [ $? == 1 ]; then tmux kill-session; fi
+#
+# is_attached - Check if current or specified session is attached
+# Arguments:
+#   $1 - Session name (optional)
+# Returns:
+#   1 if attached, 0 if detached
+#
+is_attached() {
+  local session_name="$1"
+  
+  if [ -z "$session_name" ]; then
+    session_name=$(tmux display -p '#{session_name}' 2>/dev/null) || session_name=""
+    if [ -z "$session_name" ]; then
+      echo 0
+      return
+    fi
+  fi
+  
+  local attached
+  attached=$(tmux display-message -t "${session_name}:" -p '#{session_attached}' 2>/dev/null)
+  
+  if [ "$attached" == "1" ]; then
+    echo 1
+  else
+    echo 0
+  fi
 }
 
+#
+# current_pane - Get current pane index
+# Returns:
+#   Pane index, or -1 if not in tmux
+#
 current_pane() {
   if [ -z "$TMUX_PANE" ]; then
     echo -1
   else
-    echo "$(tmux list-panes -F "#P@#D" | grep "@$TMUX_PANE" | sed "s/@$TMUX_PANE//g")"
+    tmux list-panes -F "#P@#D" | grep "@$TMUX_PANE" | sed "s/@$TMUX_PANE//g"
   fi
 }
 
-_find_panes_by_title() {
-  if [ -z "$1" ]; then return; fi
-  echo "$(tmux list-panes -F "#P:#T" | grep -E "^[0-9]+:.*?$1.*$" | sed "s/:.*//g")"
+#
+# exit_session - Exit current tmux session
+#
+exit_session() {
+  if [ "$(in_session)" == "1" ]; then
+    tmux kill-session
+  fi
 }
 
+# ============================================================================
+# TITLE AND DISPLAY FUNCTIONS
+# ============================================================================
+
+#
+# _get_pane_title - Generate formatted pane title
+# Arguments:
+#   $1 - Title text
+#   $2 - Session ID (for calculating width)
+# Returns:
+#   Formatted title string
+#
 _get_pane_title() {
-  if [ -z "$1" ]; then echo ""; return; fi
-  width=$(_get_window_width)
+  local title="$1"
+  local session_id="$2"
+  
+  if [ -z "$title" ]; then
+    echo ""
+    return
+  fi
+  
+  local width max_title_size
+  width=$(_get_window_width "$session_id")
   max_title_size=$(expr "$(expr "$width" / 2)" - 5)
-  if [ $max_title_size -gt 4 ]; then
-    title=$(echo "$1" | cut -c "-$(expr $max_title_size - 4)")
-    echo "[ $title ]"
+  
+  if [ "$max_title_size" -gt 4 ]; then
+    local truncated
+    truncated=$(echo "$title" | cut -c "-$(expr $max_title_size - 4)")
+    echo "[ $truncated ]"
   else
-    title=$(echo "$1" | cut -c "-$max_title_size")
-    echo "$title"
+    echo "$title" | cut -c "-$max_title_size"
   fi
 }
 
+#
+# _kill_process - Kill processes with specified command
+# Arguments:
+#   $1 - Kill command (e.g., "kill" or "sudo kill")
+#   $@ - PIDs to kill
+# Returns:
+#   0 on success, 1 on failure
+#
 _kill_process() {
-  if [ -z "$1" ]; then return 1; fi
-  kill_command=$1
+  local kill_command="$1"
   shift
-  success=true
+  local success=true
+  
   while [ $# -gt 0 ]; do
     if ! $kill_command "$1" >/dev/null 2>/dev/null; then
       if $kill_command -0 "$1" >/dev/null 2>/dev/null; then
@@ -238,30 +1289,388 @@ _kill_process() {
     fi
     shift
   done
-  if [ "$success" == true ]; then return 0; else return 1; fi
+  
+  if [ "$success" == true ]; then
+    return 0
+  else
+    return 1
+  fi
 }
 
-_tmon_ps_help() {
-  printf '%s\n' 'tmon ps [--raw] [-h | --help]' \
-                'List all monitored files.' \
+
+# ============================================================================
+# COMMAND: tmon session
+# Session management operations
+# ============================================================================
+
+#
+# _tmon_session_help - Show help for session command
+#
+_tmon_session_help() {
+  printf '%s\n' 'tmon session [SUBCOMMAND] [OPTIONS]' \
                 '' \
-                '  -h, --help    Display this help and exit.' \
-                '      --raw     Show raw information.' \
+                'Manage tmon sessions.' \
+                '' \
+                'Subcommands:' \
+                '  current            Show current session ID.' \
+                '  list               List all active sessions (one per line).' \
+                '  create [-d] [NAME] Create a new session. Use -d to run detached.' \
+                '  attach [ID]        Attach to a session (latest if no ID specified).' \
+                '  detach             Detach from current session.' \
+                '  switch [ID]        Switch to another session (cycles if no ID).' \
+                '  kill [ID]          Kill a session (current if no ID specified).' \
+                '  cleanup            Remove dead sessions from registry.' \
+                '' \
+                '  -h, --help         Display this help and exit.' \
+                '' \
+                'Examples:' \
+                '  tmon session current              Show current session.' \
+                '  tmon session list                 List all sessions.' \
+                '  tmon session create mysession     Create and attach to new session.' \
+                '  tmon session create -d mysession  Create detached session.' \
+                '  tmon session switch               Cycle to next session.' \
+                '  tmon session switch mysession@0   Switch to specific session.' \
                 ''
   exit
 }
 
+#
+# tmon_session - Main session command handler
+#
+tmon_session() {
+  local subcommand=""
+  local detach=false
+  local args=()
+  
+  # Parse arguments
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _tmon_session_help
+        ;;
+      -d|--detach)
+        detach=true
+        shift
+        ;;
+      --)
+        shift
+        ;;
+      *)
+        if [ -z "$subcommand" ]; then
+          subcommand="$1"
+        else
+          args+=("$1")
+        fi
+        shift
+        ;;
+    esac
+  done
+  
+  case "$subcommand" in
+    current)
+      _tmon_session_current
+      ;;
+    list)
+      _tmon_session_list
+      ;;
+    create)
+      _tmon_session_create "$detach" "${args[@]}"
+      ;;
+    attach)
+      _tmon_session_attach "${args[@]}"
+      ;;
+    detach)
+      _tmon_session_detach
+      ;;
+    switch)
+      _tmon_session_switch "${args[@]}"
+      ;;
+    kill|close)
+      _tmon_session_kill "${args[@]}"
+      ;;
+    cleanup|clean)
+      _tmon_session_cleanup
+      ;;
+    "")
+      _tmon_session_help
+      ;;
+    *)
+      echo "Unknown subcommand: $subcommand" >&2
+      _tmon_session_help
+      ;;
+  esac
+}
+
+#
+# _tmon_session_current - Show current session ID
+#
+_tmon_session_current() {
+  local session_id
+  session_id=$(_get_current_session_id)
+  
+  if [ -n "$session_id" ]; then
+    echo "$session_id"
+  else
+    echo "Not in a tmux session."
+    return 1
+  fi
+}
+
+#
+# _tmon_session_list - List all sessions
+#
+_tmon_session_list() {
+  _init_sessions_registry
+  _cleanup_dead_sessions
+  
+  local sessions_file
+  sessions_file=$(_get_sessions_file)
+  
+  if [ ! -s "$sessions_file" ]; then
+    echo "No active sessions."
+    return
+  fi
+  
+  _list_sessions
+}
+
+#
+# _tmon_session_create - Create a new session
+# Arguments:
+#   $1 - Detach flag (true/false)
+#   $2 - Session name (optional)
+#
+_tmon_session_create() {
+  local detach="${1:-false}"
+  shift
+  local session_name="${1:-}"
+  local session_id
+  
+  # Generate session name if not provided
+  if [ -z "$session_name" ]; then
+    session_name="tmon_$$_$RANDOM"
+  fi
+  
+  # Check if session already exists
+  if tmux has-session -t "$session_name" 2>/dev/null; then
+    echo "Session '$session_name' already exists." >&2
+    return 1
+  fi
+  
+  # Create session
+  session_id=$(_start_session "$session_name")
+  
+  # Register session
+  _register_session "$session_id" "active"
+  
+  echo "Created session: $session_id"
+  
+  # Attach unless detach flag is set
+  if [ "$detach" != true ]; then
+    # If we're in a session, detach first
+    if [ "$(in_session)" == "1" ]; then
+      tmux detach-client 2>/dev/null
+    fi
+    _attach_session "$session_id"
+  fi
+}
+
+#
+# _tmon_session_attach - Attach to a session
+# Arguments:
+#   $1 - Session ID (optional, uses latest if not specified)
+#
+_tmon_session_attach() {
+  local session_id="${1:-}"
+  
+  if [ -z "$session_id" ]; then
+    session_id=$(_get_latest_session)
+  fi
+  
+  if [ -z "$session_id" ]; then
+    echo "No sessions found. Create one with 'tmon session create'." >&2
+    return 1
+  fi
+  
+  if ! _session_exists_in_tmux "$session_id"; then
+    echo "Session '$session_id' not found." >&2
+    return 1
+  fi
+  
+  # Update session activity
+  _register_session "$session_id" "active"
+  
+  # If we're in a session, detach first
+  if [ "$(in_session)" == "1" ]; then
+    tmux detach-client 2>/dev/null
+  fi
+  
+  _attach_session "$session_id"
+}
+
+#
+# _tmon_session_detach - Detach from current session
+#
+_tmon_session_detach() {
+  local current_session
+  current_session=$(_get_current_session_id)
+  
+  if [ -z "$current_session" ]; then
+    echo "Not in a tmux session." >&2
+    return 1
+  fi
+  
+  _register_session "$current_session" "detached"
+  _detach_session
+}
+
+#
+# _tmon_session_switch - Switch to another session
+# Arguments:
+#   $1 - Target session ID (optional, cycles to next if not specified)
+#
+_tmon_session_switch() {
+  local target_session="${1:-}"
+  local current_session
+  
+  current_session=$(_get_current_session_id)
+  
+  if [ -z "$target_session" ]; then
+    # Cycle to next session
+    target_session=$(_get_next_session "$current_session")
+    
+    if [ -z "$target_session" ]; then
+      echo "No sessions to switch to." >&2
+      return 1
+    fi
+    
+    if [ "$target_session" == "$current_session" ]; then
+      echo "No other sessions available." >&2
+      return 1
+    fi
+  fi
+  
+  if ! _session_exists_in_tmux "$target_session"; then
+    echo "Session '$target_session' not found." >&2
+    return 1
+  fi
+  
+  # Mark current session as detached if we're in one
+  if [ -n "$current_session" ]; then
+    _register_session "$current_session" "detached"
+    tmux detach-client 2>/dev/null
+  fi
+  
+  # Activate target session
+  _register_session "$target_session" "active"
+  _attach_session "$target_session"
+}
+
+#
+# _tmon_session_kill - Kill a session
+# Arguments:
+#   $1 - Session ID (optional, uses current or latest if not specified)
+#
+_tmon_session_kill() {
+  local session_id="${1:-}"
+  local is_current=false
+  
+  if [ -z "$session_id" ]; then
+    # Try current session first
+    session_id=$(_get_current_session_id)
+    if [ -n "$session_id" ]; then
+      is_current=true
+    else
+      # Fall back to latest
+      session_id=$(_get_latest_session)
+    fi
+  fi
+  
+  if [ -z "$session_id" ]; then
+    echo "No session to kill." >&2
+    return 1
+  fi
+  
+  if ! _session_exists_in_tmux "$session_id"; then
+    # Clean up registry anyway
+    _unregister_session "$session_id"
+    echo "Session '$session_id' was already dead. Cleaned up registry."
+    return
+  fi
+  
+  local session_name
+  session_name=$(_get_session_name_from_id "$session_id")
+  
+  # Kill the tmux session
+  tmux kill-session -t "$session_name" 2>/dev/null
+  
+  # Clean up registry
+  _unregister_session "$session_id"
+  
+  echo "Killed session: $session_id"
+  
+  # If we killed the current session and there are other sessions, switch to latest
+  if [ "$is_current" == true ]; then
+    local latest
+    latest=$(_get_latest_session)
+    if [ -n "$latest" ]; then
+      _attach_session "$latest"
+    fi
+  fi
+}
+
+#
+# _tmon_session_cleanup - Clean up dead sessions from registry
+#
+_tmon_session_cleanup() {
+  _init_sessions_registry
+  _cleanup_dead_sessions
+  echo "Cleaned up dead sessions."
+}
+
+# ============================================================================
+# COMMAND: tmon ps
+# List monitored files
+# ============================================================================
+
+#
+# _tmon_ps_help - Show help for ps command
+#
+_tmon_ps_help() {
+  printf '%s\n' 'tmon ps [--raw] [-S | --session SESSION] [-h | --help]' \
+                'List all monitored files.' \
+                '' \
+                '  -S, --session SESSION   Show only specified session (default: all sessions).' \
+                '      --raw               Show raw information.' \
+                '  -h, --help              Display this help and exit.' \
+                '' \
+                'Examples:' \
+                '  tmon ps                 List monitors from all sessions.' \
+                '  tmon ps -S mysession@0  List monitors from specific session.' \
+                ''
+  exit
+}
+
+#
+# tmon_ps - List monitors
+#
 tmon_ps() {
-  ARGUMENTS=$(getopt -o "h" -l "raw,help" -- "$@" 2>/dev/null) || _tmon_ps_help
+  local ARGUMENTS
+  ARGUMENTS=$(getopt -o "hS:" -l "raw,help,session:" -- "$@" 2>/dev/null) || _tmon_ps_help
   eval "set -- ${ARGUMENTS}"
   
-  args=()
-  raw_info=false
+  local session_id=""
+  local raw_info=false
+  
   while [ $# -gt 0 ]; do
     case "$1" in
       --raw)
         raw_info=true
         shift
+        ;;
+      -S|--session)
+        session_id="$2"
+        shift 2
         ;;
       -h|--help)
         _tmon_ps_help
@@ -275,52 +1684,206 @@ tmon_ps() {
     esac
   done
   
+  # Resolve session (empty means all sessions)
+  session_id=$(_resolve_session_ps "$session_id")
+  
+  if [ -n "$session_id" ]; then
+    # Show specific session
+    _tmon_ps_session "$session_id" "$raw_info"
+  else
+    # Show all sessions
+    _tmon_ps_all "$raw_info"
+  fi
+}
+
+#
+# _tmon_ps_session - Show monitors for a specific session
+#
+_tmon_ps_session() {
+  local session_id="$1"
+  local raw_info="$2"
+  local session_name
+  
+  session_name=$(_get_session_name_from_id "$session_id")
+  
+  if ! _session_exists_in_tmux "$session_id"; then
+    echo "Session '$session_id' not found." >&2
+    return 1
+  fi
+  
+  # Update activity
+  _register_session "$session_id" "active"
+  
   if [ "$raw_info" == true ]; then
-    _get_monitored_files | while IFS= read -r line || [ -n "$line" ]; do
+    _get_monitored_files "$session_id" | while IFS= read -r line || [ -n "$line" ]; do
       IFS="|" read -r file title pid tmp dead <<< "$line"
-      echo "$tmp|$file|$title|$pid|$dead"
+      echo "${session_id}|${tmp}|${file}|${title}|${pid}|${dead}"
     done
   else
-    info=()
+    local info=()
     while IFS= read -r line || [ -n "$line" ]; do
       IFS="|" read -r file title pid tmp dead <<< "$line"
+      local status
       if [ -n "$dead" ]; then status=closed; else status=open; fi
       if [ -z "$tmp" ]; then tmp=" "; fi
       if [ -z "$file" ]; then file=" "; fi
       if [ -z "$title" ]; then title=" "; fi
       if [ -z "$pid" ]; then pid=" "; fi
-      info=("${info[@]}" "$tmp|$status|$pid|$title|$file")
-    done < <(_get_monitored_files)
+      info=("${info[@]}" "$session_id|$tmp|$status|$pid|$title|$file")
+    done < <(_get_monitored_files "$session_id")
+    
     if [ "${#info[@]}" -gt 0 ]; then
-      info=("Monitor ID|Status|PID|Title|File" "${info[@]}")
+      info=("Session|ID|Status|PID|Title|File" "${info[@]}")
       for line in "${info[@]}"; do
         echo "$line"
       done | column -t -s "|"
+      echo ""
     fi
   fi
 }
 
-_clear_help() {
-  printf '%s\n' 'tmon clear [-h | --help]' \
-                'Close all panes but preserve file monitors.' \
+#
+# _tmon_ps_all - Show monitors for all sessions
+#
+_tmon_ps_all() {
+  local raw_info="$1"
+  
+  _init_sessions_registry
+  _cleanup_dead_sessions
+  
+  local sessions
+  sessions=$(_list_sessions)
+  
+  if [ -z "$sessions" ]; then
+    echo "No active monitors."
+    return
+  fi
+  
+  if [ "$raw_info" == true ]; then
+    # Raw mode: output each session's data directly
+    while IFS= read -r session_id; do
+      if [ -n "$session_id" ]; then
+        _get_monitored_files "$session_id" | while IFS= read -r line || [ -n "$line" ]; do
+          IFS="|" read -r file title pid tmp dead <<< "$line"
+          echo "${session_id}|${tmp}|${file}|${title}|${pid}|${dead}"
+        done
+      fi
+    done <<< "$sessions"
+  else
+    # Normal mode: collect all data and output with single header
+    local all_info=()
+    while IFS= read -r session_id; do
+      if [ -n "$session_id" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+          IFS="|" read -r file title pid tmp dead <<< "$line"
+          local status
+          if [ -n "$dead" ]; then status=closed; else status=open; fi
+          if [ -z "$tmp" ]; then tmp=" "; fi
+          if [ -z "$file" ]; then file=" "; fi
+          if [ -z "$title" ]; then title=" "; fi
+          if [ -z "$pid" ]; then pid=" "; fi
+          all_info=("${all_info[@]}" "$session_id|$tmp|$status|$pid|$title|$file")
+        done < <(_get_monitored_files "$session_id")
+      fi
+    done <<< "$sessions"
+    
+    if [ "${#all_info[@]}" -gt 0 ]; then
+      all_info=("Session|ID|Status|PID|Title|File" "${all_info[@]}")
+      for line in "${all_info[@]}"; do
+        echo "$line"
+      done | column -t -s "|"
+    else
+      echo "No active monitors."
+    fi
+  fi
+}
+
+# ============================================================================
+# COMMAND: tmon open
+# Open file monitors in panes
+# ============================================================================
+
+#
+# _tmon_open_help - Show help for open command
+#
+_tmon_open_help() {
+  printf '%s\n' 'tmon open [-c | --create] [-C | --cut NCOLS] [-s | --sudo] [-f | --full] ' \
+                '          [-t | --title TITLE] [-d | --detach] [-S | --session SESSION] [-h | --help] [FILE]...' \
                 '' \
-                '  -h, --help    Display this help and exit.' \
+                'Monitor files in separate tmux panes.' \
+                '' \
+                '  -c, --create            Create target files when not exist.' \
+                '  -C, --cut NCOLS         Show only first NCOLS characters per row.' \
+                '  -s, --sudo              Use sudo when creating and opening files.' \
+                '  -d, --detach            Monitor the file but do not open a pane.' \
+                '  -f, --full              Show absolute path on pane title.' \
+                '  -t, --title TITLE       Overwrite pane title with specified content.' \
+                '  -S, --session SESSION   Target session (default: current, or latest if outside tmux).' \
+                '  -h, --help              Display this help and exit.' \
+                '' \
+                'Session Selection:' \
+                '  - Inside tmux: uses current session' \
+                '  - Outside tmux: attaches to latest session (creates if none exists)' \
                 '' \
                 'Examples:' \
-                '  tmon clear    Close all panes.'
+                '  tmon open -c log.txt              Monitor log.txt (creates if needed).' \
+                '  tmon open -S mysession log.txt    Open in specific session.' \
+                '  tmon open -s /var/log/syslog      Monitor with sudo.' \
                 ''
   exit
 }
 
-tmon_clear() {
-  ARGUMENTS=$(getopt -o "h" -l "help" -- "$@" 2>/dev/null) || _clear_help
+#
+# tmon_open - Open file monitors
+#
+tmon_open() {
+  local ARGUMENTS
+  ARGUMENTS=$(getopt -o "s,c,C:,f,t:,d,S:,h" -l "sudo,create,cut:,full,title:,detach,session:,help" -- "$@" 2>/dev/null) || _tmon_open_help
   eval "set -- ${ARGUMENTS}"
+
+  local args=()
+  local use_sudo=false
+  local detached=false
+  local absolute_path=false
+  local create=false
+  local overwrite_title=false
+  local title=""
+  local session_id=""
+  local cut=""
   
-  args=()
   while [ $# -gt 0 ]; do
     case "$1" in
+      -s|--sudo)
+        use_sudo=true
+        shift
+        ;;
+      -d|--detach)
+        detached=true
+        shift
+        ;;
+      -c|--create)
+        create=true
+        shift
+        ;;
+      -C|--cut)
+        cut="$2"
+        shift 2
+        ;;
+      -f|--full)
+        absolute_path=true
+        shift
+        ;;
+      -t|--title)
+        overwrite_title=true
+        title="$2"
+        shift 2
+        ;;
+      -S|--session)
+        session_id="$2"
+        shift 2
+        ;;
       -h|--help)
-        _clear_help
+        _tmon_open_help
         ;;
       --)
         shift
@@ -332,37 +1895,380 @@ tmon_clear() {
     esac
   done
 
-  if [ "$(current_pane)" != 0 ]; then tmux swap-pane -U; fi
-  tmux kill-pane -a -t 0
+  # Validate cut parameter
+  if expr "$cut" : '^[0-9]\+$' >/dev/null; then
+    cut=" | cut -c \"-$cut\""
+  else
+    cut=""
+  fi
+
+  # Resolve session
+  local resolved_session
+  _resolve_session_created=false
+  resolved_session=$(_resolve_session_open "$session_id" true)
+  
+  if [ -z "$resolved_session" ]; then
+    echo "Failed to resolve session." >&2
+    return 1
+  fi
+  
+  # Check if session was created (output starts with CREATED:)
+  if echo "$resolved_session" | grep -q "^CREATED:"; then
+    _resolve_session_created=true
+    session_id=$(echo "$resolved_session" | sed 's/^CREATED://')
+  else
+    session_id="$resolved_session"
+  fi
+  
+  # Prepare session
+  _prepare_session_tmp "$session_id"
+  _register_session "$session_id" "active"
+  
+  local session_name
+  session_name=$(_get_session_name_from_id "$session_id")
+  
+  # Process each file
+  local i=0
+  while [ $i -lt ${#args[@]} ]; do
+    local file="${args[$i]}"
+    
+    if [ "$create" == true ] || [ -f "$file" ]; then
+      local abspath
+      abspath=$(_abspath "$file")
+      
+      # Create file if needed
+      if [ "$create" == true ] && [ ! -e "$file" ]; then
+        if [ "$use_sudo" == true ]; then
+          "$sudo" touch "$file"
+        else
+          touch "$file"
+        fi
+      fi
+      
+      # Create pane (unless detached)
+      if [ "$detached" != true ]; then
+        local new_pane_index
+        
+        if [ "$use_sudo" == true ]; then
+          new_pane_index=$(_split_window "-v" "\"$sudo\" tail -n +0 -f \"${file}\"${cut}" "$session_id")
+        else
+          if [ ! -r "$file" ]; then
+            echo "Cannot read file: $file" >&2
+            i=$(expr $i + 1)
+            continue
+          fi
+          new_pane_index=$(_split_window "-v" "tail -n +0 -f \"${file}\"${cut}" "$session_id")
+        fi
+        
+        # Set title
+        if [ "$overwrite_title" == false ]; then
+          if [ "$absolute_path" == true ]; then
+            title="$abspath"
+          else
+            title=$(basename "$file")
+          fi
+        fi
+        
+        # Select the newly created pane and set its title
+        local pane_title
+        pane_title=$(_get_pane_title "$title" "$session_id")
+        _select_pane "$new_pane_index" "$session_id" "$pane_title"
+      fi
+      
+      # Register monitor
+      local tmp_index
+      tmp_index=$(_get_tmp_index "$session_id")
+      if [ -n "$tmp_index" ]; then
+        touch "$(_get_tmp_stdout "$tmp_index" "$session_id")"
+      fi
+      
+      _monitor_append "$abspath" "$title" "" "$tmp_index" "" "$session_id"
+    else
+      echo "File not found: $file" >&2
+    fi
+    
+    i=$(expr $i + 1)
+  done
+  
+  _monitor_file_check "$session_id"
+  
+  # Set layout and attach if needed
+  if [ "$detached" != true ]; then
+    _set_layout "$session_id"
+    
+    # Attach if we created a new session and we're not in tmux
+    if [ "$_resolve_session_created" == true ] && [ "$(in_session)" == "0" ]; then
+      _attach_session "$session_id"
+    fi
+  fi
 }
 
-_tmon_monitor_help() {
-  printf '%s\n' 'tmon monitor [-p | --preserve] [-s | --sudo] [-i | --id] [-a | --all] [-h | --help] [[NPANES] | [ID]...]' \
+
+# ============================================================================
+# COMMAND: tmon exec
+# Execute commands and capture output
+# ============================================================================
+
+#
+# _tmon_exec_help - Show help for exec command
+#
+_tmon_exec_help() {
+  printf '%s\n' 'tmon exec [-o] [-e] [--stdout FILE] [--stderr FILE] [-s | --sudo] [-d | --detach]' \
+                '          [-t | --title TITLE] [-a | --append] [-S | --session SESSION] [-h | --help] ARGS...' \
                 '' \
-                'Clear all panes and open the last NPANES monitored files. Open 2 files when NPANES is not passed.' \
+                'Execute command and show output in separate tmux panes.' \
                 '' \
-                '  -p, --preserve    Do not close panes before open.' \
-                '  -s, --sudo        Use sudo when opening files.' \
-                '  -i, --id          Open panes by monitor ID instead.' \
-                '  -a, --all         Open all monitors and ignore NPANES or ID.' \
-                '  -h, --help        Display this help and exit.' \
+                '  -o                      Show stdout in a tmux pane.' \
+                '  -e                      Show stderr in a tmux pane.' \
+                '  -s, --sudo              Use sudo when creating and opening files.' \
+                '  -d, --detach            Monitor the process but do not open panes.' \
+                '  -t, --title TITLE       Overwrite pane title with specified content.' \
+                '  -a, --append            Record stdout and stderr with appending mode.' \
+                '  -S, --session SESSION   Target session (default: current, or latest if outside tmux).' \
+                '      --stdout FILE       Record stdout to FILE (temp file if not specified).' \
+                '      --stderr FILE       Record stderr to FILE (temp file if not specified).' \
+                '  -h, --help              Display this help and exit.' \
+                '' \
+                'Session Selection:' \
+                '  - Inside tmux: uses current session' \
+                '  - Outside tmux: attaches to latest session (creates if none exists)' \
                 '' \
                 'Examples:' \
-                '  tmon monitor -p 2      Preserve current panes and open the last 2 monitored files.' \
-                '  tmon monitor -i 100    Open the monitor of ID 100.' \
+                '  tmon exec -o -e mycommand          Show both stdout and stderr.' \
+                '  tmon exec -d -- sleep 60           Monitor in background.' \
                 ''
   exit
 }
 
+#
+# tmon_exec - Execute command with output capture
+#
+tmon_exec() {
+  local args=()
+  local use_sudo=false
+  local detached=false
+  local stdout_file=""
+  local stderr_file=""
+  local log_stdout=false
+  local log_stderr=false
+  local overwrite_title=false
+  local append=false
+  local _title=""
+  local session_id=""
+  
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -s|--sudo)
+        use_sudo=true
+        shift
+        ;;
+      -d|--detach)
+        detached=true
+        shift
+        ;;
+      -t|--title)
+        overwrite_title=true
+        _title="$2"
+        shift 2
+        ;;
+      -h|--help)
+        _tmon_exec_help
+        ;;
+      -o)
+        log_stdout=true
+        shift
+        ;;
+      -e)
+        log_stderr=true
+        shift
+        ;;
+      --stdout)
+        stdout_file="$2"
+        shift 2
+        ;;
+      --stderr)
+        stderr_file="$2"
+        shift 2
+        ;;
+      -a|--append)
+        append=true
+        shift
+        ;;
+      -S|--session)
+        session_id="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        ;;
+      *)
+        args+=("$@")
+        break
+        ;;
+    esac
+  done
+  
+  if [ ${#args[@]} -eq 0 ]; then
+    _tmon_exec_help
+  fi
+  
+  # Resolve session
+  local resolved_session
+  _resolve_session_created=false
+  resolved_session=$(_resolve_session_open "$session_id" true)
+  
+  if [ -z "$resolved_session" ]; then
+    echo "Failed to resolve session." >&2
+    return 1
+  fi
+  
+  # Check if session was created (output starts with CREATED:)
+  if echo "$resolved_session" | grep -q "^CREATED:"; then
+    _resolve_session_created=true
+    session_id=$(echo "$resolved_session" | sed 's/^CREATED://')
+  else
+    session_id="$resolved_session"
+  fi
+  
+  _prepare_session_tmp "$session_id"
+  _register_session "$session_id" "active"
+  
+  # Get temp index and set up output files
+  local tmp_index
+  tmp_index=$(_get_tmp_index "$session_id")
+  
+  if [ -n "$tmp_index" ]; then
+    touch "$(_get_tmp_stdout "$tmp_index" "$session_id")"
+  fi
+  
+  if [ -z "$stdout_file" ] || [ -z "$stderr_file" ]; then
+    if [ -z "$tmp_index" ]; then
+      if [ -z "$stdout_file" ]; then stdout_file=nohup.out; fi
+      if [ -z "$stderr_file" ]; then stderr_file=nohup.err; fi
+    else
+      stdout_file=$(_get_tmp_stdout "$tmp_index" "$session_id")
+      stderr_file=$(_get_tmp_stderr "$tmp_index" "$session_id")
+    fi
+  fi
+  
+  # Build and execute command
+  local args_string
+  args_string=$(_escape_monitor_arg "${args[*]}")
+  
+  local redirect
+  if [ "$append" == true ]; then
+    redirect=">>\"$stdout_file\" 2>>\"$stderr_file\""
+  else
+    redirect=">\"$stdout_file\" 2>\"$stderr_file\""
+  fi
+  
+  if [ "$use_sudo" == true ]; then
+    ("$sudo" nohup sh -c "${args[*]} ${redirect}") >/dev/null 2>/dev/null &
+  else
+    (nohup sh -c "${args[*]} ${redirect}") >/dev/null 2>/dev/null &
+  fi
+  
+  local pid=$!
+  
+  # Create panes for output (unless detached)
+  if [ "$detached" != true ]; then
+    local session_name
+    session_name=$(_get_session_name_from_id "$session_id")
+    
+    if [ "$log_stderr" == true ]; then
+      touch "$stderr_file"
+      local title
+      if [ "$overwrite_title" == true ]; then
+        title="stderr ${_title}"
+      else
+        title="stderr $args_string"
+      fi
+      
+      local stderr_pane_index
+      stderr_pane_index=$(_split_window "-v" "tail -n +0 -f \"${stderr_file}\"" "$session_id")
+      _select_pane "$stderr_pane_index" "$session_id" "$(_get_pane_title "$title" "$session_id")"
+      
+      local abspath
+      abspath=$(_abspath "$stderr_file")
+      _monitor_append "$abspath" "$title" "$pid" "$tmp_index" "" "$session_id"
+    fi
+    
+    if [ "$log_stdout" == true ]; then
+      touch "$stdout_file"
+      local title
+      if [ "$overwrite_title" == true ]; then
+        title="stdout ${_title}"
+      else
+        title="stdout $args_string"
+      fi
+      
+      local stdout_pane_index
+      stdout_pane_index=$(_split_window "-v" "tail -n +0 -f \"${stdout_file}\"" "$session_id")
+      _select_pane "$stdout_pane_index" "$session_id" "$(_get_pane_title "$title" "$session_id")"
+      
+      local abspath
+      abspath=$(_abspath "$stdout_file")
+      _monitor_append "$abspath" "$title" "$pid" "$tmp_index" "" "$session_id"
+    fi
+    
+    _set_layout "$session_id"
+    
+    # Attach if we created a new session and we're not in tmux
+    if [ "$_resolve_session_created" == true ] && [ "$(in_session)" == "0" ]; then
+      _attach_session "$session_id"
+    fi
+  fi
+  
+  _monitor_file_check "$session_id"
+}
+
+# ============================================================================
+# COMMAND: tmon monitor
+# Show monitored files in panes
+# ============================================================================
+
+#
+# _tmon_monitor_help - Show help for monitor command
+#
+_tmon_monitor_help() {
+  printf '%s\n' 'tmon monitor [-p | --preserve] [-s | --sudo] [-i | --id] [-a | --all] [-S | --session SESSION] [-h | --help] [[NPANES] | [ID]...]' \
+                '' \
+                'Show monitored files in tmux panes.' \
+                '' \
+                '  -p, --preserve          Do not close panes before opening.' \
+                '  -s, --sudo              Use sudo when opening files.' \
+                '  -i, --id                Open panes by monitor ID instead.' \
+                '  -a, --all               Open all monitors.' \
+                '  -S, --session SESSION   Target session (default: current, or latest if outside tmux).' \
+                '  -h, --help              Display this help and exit.' \
+                '' \
+                'Session Selection:' \
+                '  - Inside tmux: uses current session' \
+                '  - Outside tmux: attaches to latest session (creates if none exists)' \
+                '' \
+                'Examples:' \
+                '  tmon monitor -p 2       Preserve panes, open last 2 monitors.' \
+                '  tmon monitor -i 100     Open monitor with ID 100.' \
+                '  tmon monitor -a         Open all monitors.' \
+                ''
+  exit
+}
+
+#
+# tmon_monitor - Show monitors in panes
+#
 tmon_monitor() {
-  ARGUMENTS=$(getopt -o "c,s,i,a,h" -l "clear,sudo,id,all,help" -- "$@" 2>/dev/null) || _tmon_monitor_help
+  local ARGUMENTS
+  ARGUMENTS=$(getopt -o "p,s,i,a,S:,h" -l "preserve,sudo,id,all,session:,help" -- "$@" 2>/dev/null) || _tmon_monitor_help
   eval "set -- ${ARGUMENTS}"
 
-  args=()
-  use_sudo=false
-  clear=true
-  by_id=false
-  show_all=false
+  local args=()
+  local use_sudo=false
+  local clear=true
+  local by_id=false
+  local show_all=false
+  local session_id=""
+  
   while [ $# -gt 0 ]; do
     case "$1" in
       -p|--preserve)
@@ -381,6 +2287,10 @@ tmon_monitor() {
         show_all=true
         shift
         ;;
+      -S|--session)
+        session_id="$2"
+        shift 2
+        ;;
       -h|--help)
         _tmon_monitor_help
         ;;
@@ -394,30 +2304,62 @@ tmon_monitor() {
     esac
   done
   
-  if [ "$clear" == true ]; then
-    if [ "$(current_pane)" != 0 ]; then tmux swap-pane -U; fi
-    tmux kill-pane -a -t 0
+  # Resolve session
+  local resolved_session
+  _resolve_session_created=false
+  resolved_session=$(_resolve_session_open "$session_id" true)
+  
+  if [ -z "$resolved_session" ]; then
+    echo "Failed to resolve session." >&2
+    return 1
   fi
   
-  attached=$(in_session)
-  if [ $attached == 0 ]; then _start_session; fi
+  # Check if session was created (output starts with CREATED:)
+  if echo "$resolved_session" | grep -q "^CREATED:"; then
+    _resolve_session_created=true
+    session_id=$(echo "$resolved_session" | sed 's/^CREATED://')
+  else
+    session_id="$resolved_session"
+  fi
   
-  target_files=()
-  if [ "$by_id" == true -o "$show_all" == true ]; then
-    lines=()
-    open_dead=false
+  _prepare_session_tmp "$session_id"
+  _register_session "$session_id" "active"
+  
+  local session_name
+  session_name=$(_get_session_name_from_id "$session_id")
+  
+  # Clear panes if requested
+  if [ "$clear" == true ]; then
+    _kill_all_panes_except_first "$session_id"
+  fi
+  
+  # Collect target files to monitor
+  local target_files=()
+  local lines=()
+  local open_dead=false
+  
+  if [ "$by_id" == true ] || [ "$show_all" == true ]; then
+    # Open by ID or all
     while IFS= read -r line || [ -n "$line" ]; do
       IFS="|" read -r file title pid tmp dead <<< "$line"
-      success=false
+      local success=false
+      
       if [ "$show_all" == true ]; then
         success=true
       else
         for monitor_id in "${args[@]}"; do
-          if [ "$monitor_id" == "$tmp" ]; then success=true; break; fi
+          if [ "$monitor_id" == "$tmp" ]; then
+            success=true
+            break
+          fi
         done
       fi
-      if [ ! $use_sudo == true -a ! -r "$file" ]; then success=false; fi
-      if [ $success == true ]; then
+      
+      if [ "$use_sudo" != true ] && [ ! -r "$file" ]; then
+        success=false
+      fi
+      
+      if [ "$success" == true ]; then
         if [ -z "$title" ]; then title=$(basename "$file"); fi
         if [ -n "$dead" ]; then open_dead=true; fi
         target_files=("${target_files[@]}" "$file|$title")
@@ -425,358 +2367,138 @@ tmon_monitor() {
       else
         lines=("${lines[@]}" "$line")
       fi
-    done < <(_get_monitored_files)
-    if [ $open_dead == true ]; then
-      monitor_file=$(_get_monitor_file)
+    done < <(_get_monitored_files "$session_id")
+    
+    # Reopen dead monitors if needed
+    if [ "$open_dead" == true ]; then
+      local monitor_file monitor_tmpfile
+      monitor_file=$(_get_monitor_file "$session_id")
       monitor_tmpfile="${monitor_file}.tmp"
-      if [ ! -f "$monitor_file" ]; then
-        if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
-      else
-        if [ -f "$monitor_tmpfile" ]; then rm -f "$monitor_tmpfile"; fi
-      fi
+      
+      > "$monitor_tmpfile"
       for line in "${lines[@]}"; do
         echo "$line" >> "$monitor_tmpfile"
       done
-      if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+      
+      mv -f "$monitor_tmpfile" "$monitor_file"
     fi
   else
-    if [ -z "${args[0]}" ]; then num_files=2; else num_files="${args[0]}"; fi
-    lines=()
+    # Open last N monitors
+    local num_files
+    if [ -z "${args[0]}" ]; then
+      num_files=2
+    else
+      num_files="${args[0]}"
+    fi
+    
     while IFS= read -r line || [ -n "$line" ]; do
       IFS="|" read -r file title pid tmp dead <<< "$line"
       if [ -n "$dead" ]; then continue; fi
-      if [ ! $use_sudo == true -a ! -r "$file" ]; then continue; fi
+      if [ "$use_sudo" != true ] && [ ! -r "$file" ]; then continue; fi
       if [ -z "$title" ]; then title=$(basename "$file"); fi
       lines=("$file|$title" "${lines[@]}")
-    done < <(_get_monitored_files)
+    done < <(_get_monitored_files "$session_id")
+    
     for line in "${lines[@]}"; do
       IFS="|" read -r file title <<< "$line"
       target_files=("$file|$title" "${target_files[@]}")
-      if [ "${#target_files[@]}" -ge "$num_files" ]; then break; fi
+      if [ ${#target_files[@]} -ge "$num_files" ]; then
+        break
+      fi
     done
   fi
-
-  i=0
+  
+  # Create panes for target files
+  local i=0
   for file_title in "${target_files[@]}"; do
     IFS="|" read -r file title <<< "$file_title"
+    
     if [ -f "$file" ]; then
-      if [ "$i" -gt 0 ]; then tmux_args="-v"; else tmux_args="-h -p 50"; fi
-      if [ $use_sudo == true ]; then
-        tmux split-window $tmux_args "\"$sudo\" tail -n +0 -f \"${file}\""
+      local tmux_args
+      if [ $i -gt 0 ]; then
+        tmux_args="-v"
       else
-        if [ ! -r "$file" ]; then continue; fi
-        tmux split-window $tmux_args "tail -n +0 -f \"${file}\""
+        tmux_args="-h -p 50"
       fi
-      i=$(expr "$i" + 1)
-      tmux select-pane -T "$(_get_pane_title "$title")"
-    fi
-  done
-  _set_layout
-
-  if [ $attached == 0 ]; then tmux attach; fi
-}
-
-_tmon_exec_help() {
-  printf '%s\n' 'tmon exec [-o] [-e] [--stdout FILE] [--stderr FILE] [-s | --sudo] [-d | --detach]' \
-                '          [-t | --title TITLE] [-a | --append] [-h | --help] ARGS...' \
-                '' \
-                'Execute command and show output in separate tmux panes.' \
-                '' \
-                '  -o                   Show stdout in a tmux pane.' \
-                '  -e                   Show stderr in a tmux pane.' \
-                '  -s, --sudo           Use sudo when creating and opening files.' \
-                '  -t, --title          Overwrite pane title with specified content.' \
-                '  -a, --append         Record stdout and stderr with appending mode.' \
-                '  -d, --detach         Monitor the process but do not open panes.' \
-                '      --stdout FILE    Record stdout to FILE. Use temporary file when not specified.' \
-                '      --stderr FILE    Record stderr to FILE. Use temporary file when not specified.' \
-                '  -h, --help           Display this help and exit.' \
-                '' \
-                'Examples:' \
-                '  tmon exec -e command    Execute command and show stderr.' \
-                '  tmon exec -o --stdout /tmp/stdout.log -a -d command' \
-                '      Execute command and append output to /tmp/stdout.log without opening an extra pane.' \
-                ''
-  exit
-}
-
-tmon_exec() {
-  args=()
-  use_sudo=false
-  detached=false
-  stdout_file=
-  stderr_file=
-  log_stdout=false
-  log_stderr=false
-  overwrite_title=false
-  append=false
-  _title=
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      -s|--sudo)
-        use_sudo=true
-        shift
-        ;;
-      -d|--detach)
-        detached=true
-        shift
-        ;;
-      -t|--title)
-        overwrite_title=true
-        _title=$2
-        shift 2
-        ;;
-      -h|--help)
-        _tmon_exec_help
-        ;;
-      -o)
-        log_stdout=true
-        shift
-        ;;
-      -e)
-        log_stderr=true
-        shift
-        ;;
-      --stdout)
-        stdout_file=$2
-        shift 2
-        ;;
-      --stderr)
-        stderr_file=$2
-        shift 2
-        ;;
-      -a|--append)
-        append=true
-        shift
-        ;;
-      --)
-        shift
-        ;;
-      *)
-        args+=("$@")
-        break
-        ;;
-    esac
-  done
-  
-  if [ "${#args[@]}" == 0 ]; then _tmon_exec_help; fi
-  
-  tmp_index=$(_get_tmp_index)
-  if [ -n "$tmp_index" ]; then
-    touch "$(_get_tmp_stdout "$tmp_index")"
-  fi
-  if [ -z "$stdout_file" -o -z "$stderr_file" ]; then
-    if [ -z "$tmp_index" ]; then
-      if [ -z "$stdout_file" ]; then stdout_file=nohup.out; fi
-      if [ -z "$stderr_file" ]; then stderr_file=nohup.err; fi
-    else
-      stdout_file=$(_get_tmp_stdout "$tmp_index")
-      stderr_file=$(_get_tmp_stderr "$tmp_index")
-    fi
-  fi
-  
-  args_string=$(_escape_monitor_arg "${args[*]}")
-  if [ "$append" == true ]; then
-    redirect=">>\"$stdout_file\" 2>>\"$stderr_file\""
-  else
-    redirect=">\"$stdout_file\" 2>\"$stderr_file\""
-  fi
-  if [ "$use_sudo" == true ]; then
-    args=("$sudo" nohup sh -c "${args[*]} ${redirect}")
-  else
-    args=(nohup sh -c "${args[*]} ${redirect}")
-  fi
-  "${args[@]}" >/dev/null 2>/dev/null &
-  pid=$!
-
-  if [ ! "$detached" == true ]; then
-    attached=$(in_session)
-    if [ $attached == 0 ]; then _start_session; fi  
-  fi
-
-  if [ "$log_stderr" == true ]; then
-    touch "$stderr_file"
-    if [ "$overwrite_title" == true ]; then title="stderr ${_title}"; else title="stderr $args_string"; fi
-    if [ ! "$detached" == true ]; then
-      tmux split-window -v "tail -n +0 -f \"${stderr_file}\""
-      tmux select-pane -T "$(_get_pane_title "$title")"
-    fi
-    abspath=$(_abspath "$stderr_file")
-    _monitor_append "$abspath" "$title" "$pid" "$tmp_index" ""
-  fi
-
-  if [ "$log_stdout" == true ]; then
-    touch "$stdout_file"
-    if [ "$overwrite_title" == true ]; then title="stdout ${_title}"; else title="stdout $args_string"; fi
-    if [ ! "$detached" == true ]; then
-      tmux split-window -v "tail -n +0 -f \"${stdout_file}\""
-      tmux select-pane -T "$(_get_pane_title "$title")"
-    fi
-    abspath=$(_abspath "$stdout_file")
-    _monitor_append "$abspath" "$title" "$pid" "$tmp_index" ""
-  fi
-  
-  _monitor_file_check
-  
-  if [ ! "$detached" == true ]; then
-    _set_layout
-    if [ $attached == 0 ]; then tmux attach; fi
-  fi
-}
-
-_tmon_open_help() {
-  printf '%s\n' 'tmon open [-c | --create] [-C | --cut NCOLS] [-s | --sudo] [-f | --full] ' \
-                '          [-t | --title TITLE] [-d | --detach] [-h | --help] [FILE]...' \
-                '' \
-                'Monitor files in separate tmux windows.' \
-                '' \
-                '  -c, --create    Create target files when not exist.' \
-                '  -C, --cut       Show the file with only the first NCOLS characters preserved per row.' \
-                '  -s, --sudo      Use sudo when creating and opening files.' \
-                '  -d, --detach    Monitor the file but do not open a pane.' \
-                '  -f, --full      Show absolute path on pane title.' \
-                '  -t, --title     Overwrite pane title with specified content.' \
-                '  -h, --help      Display this help and exit.' \
-                '' \
-                'Examples:' \
-                '  tmon open -c log.txt          Monitor log.txt with tmux. Create the file when not exist.' \
-                '  tmon open -s /var/log/syslog  Monitor /var/log/syslog with root privilege.' \
-                ''
-  exit
-}
-
-tmon_open() {
-  ARGUMENTS=$(getopt -o "s,c,C:,f,t:,d,h" -l "sudo,create,cut:,full,title:,detach,help" -- "$@" 2>/dev/null) || _tmon_open_help
-  eval "set -- ${ARGUMENTS}"
-
-  args=()
-  use_sudo=false
-  detached=false
-  absolute_path=false
-  create=false
-  overwrite_title=false
-  title=
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      -s|--sudo)
-        use_sudo=true
-        shift
-        ;;
-      -d|--detach)
-        detached=true
-        shift
-        ;;
-      -c|--create)
-        create=true
-        shift
-        ;;
-      -C|--cut)
-        cut=$2
-        shift 2
-        ;;
-      -f|--full)
-        absolute_path=true
-        shift
-        ;;
-      -t|--title)
-        overwrite_title=true
-        title=$2
-        shift 2
-        ;;
-      -h|--help)
-        _tmon_open_help
-        ;;
-      --)
-        shift
-        ;;
-      *)
-        args+=("$1")
-        shift
-        ;;
-    esac
-  done
-
-  if expr "$cut" : '^[0-9]\+$' >/dev/null; then cut=" | cut -c \"-$cut\""; else cut="" ; fi
-
-  if [ ! "$detached" == true ]; then
-    attached=$(in_session)
-    if [ $attached == 0 ]; then _start_session; fi
-  fi
-  
-  i=0
-  while [ $i -lt ${#args[@]} ]; do
-    file=${args[$i]}
-    if [ ${create} == true -o -f ${file} ]; then
-      abspath=$(_abspath "$file")
-      if [ $use_sudo == true ]; then 
-        if [ ${create} == true -a ! -e ${file} ]; then "$sudo" touch "$file"; fi
-        if [ ! "$detached" == true ]; then tmux split-window -v "\"$sudo\" tail -n +0 -f \"${file}\"${cut}"; fi
+      
+      local new_pane_index
+      if [ "$use_sudo" == true ]; then
+        new_pane_index=$(_split_window "$tmux_args" "\"$sudo\" tail -n +0 -f \"${file}\"" "$session_id")
       else
-        if [ ${create} == true -a ! -e ${file} ]; then touch "$file"; fi
-        if [ ! "$detached" == true ]; then tmux split-window -v "tail -n +0 -f \"${file}\"${cut}"; fi
+        new_pane_index=$(_split_window "$tmux_args" "tail -n +0 -f \"${file}\"" "$session_id")
       fi
-      if [ ${overwrite_title} == false ]; then
-        if [ ${absolute_path} == true ]; then title="$abspath"; else title=$(basename "$file"); fi
-      fi
-      if [ ! "$detached" == true ]; then tmux select-pane -T "$(_get_pane_title "$title")"; fi
-      tmp_index=$(_get_tmp_index)
-      if [ -n "$tmp_index" ]; then
-        dummy_stdout_file=$(_get_tmp_stdout "$tmp_index")
-        touch "$dummy_stdout_file"
-      fi
-      _monitor_append "$abspath" "$title" "" "$tmp_index" ""
+      
+      i=$(expr $i + 1)
+      _select_pane "$new_pane_index" "$session_id" "$(_get_pane_title "$title" "$session_id")"
     fi
-    i=$(expr $i + 1)
   done
-  _monitor_file_check
   
-  if [ ! "$detached" == true ]; then
-    _set_layout
-    if [ $attached == 0 ]; then tmux attach; fi
+  _set_layout "$session_id"
+  
+  # Attach if we created a new session and we're not in tmux
+  if [ "$_resolve_session_created" == true ] && [ "$(in_session)" == "0" ]; then
+    _attach_session "$session_id"
   fi
 }
 
+# ============================================================================
+# COMMAND: tmon kill
+# Kill monitors and panes
+# ============================================================================
+
+#
+# _tmon_kill_help - Show help for kill command
+#
 _tmon_kill_help() {
   printf '%s\n' 'tmon kill [-t | --title] [-f | --file] [-p | --pid] [-P | --process] [-s | --sudo]' \
-                '          [--full-match] [-r | --regex] [-h | --help] [--preserve] [-a | --all] [NAMES]...' \
+                '          [--full-match] [-r | --regex] [--preserve] [-a | --all] [-S | --session SESSION] [-h | --help] [NAMES]...' \
                 '' \
-                'Remove file monitors and corresponding panes. By default, remove monitors by monitor ID.' \
+                'Remove file monitors and corresponding panes.' \
                 '' \
-                '  -t, --title         Remove monitors by pane title.' \
-                '                      Please be cautious that all panes of the same title will be killed.' \
-                '  -f, --file          Remove monitors by file path.' \
-                '      --full-match    When passed, only fully matched files (or titles) will be removed.' \
-                '  -r, --regex         Use regular expression matching.' \
-                '  -p, --pid           Remove monitors by PID.' \
-                '  -P, --process       Kill the corresponding processes.' \
-                '  -s, --sudo          Use sudo when killing processes.' \
-                '      --preserve      Do not kill corresponding panes.' \
-                '  -a, --all           Clear all file monitors.' \
-                '  -h, --help          Display this help and exit.' \
+                '  -t, --title             Remove monitors by pane title.' \
+                '  -f, --file              Remove monitors by file path.' \
+                '  -p, --pid               Remove monitors by PID.' \
+                '  -P, --process           Kill the corresponding processes.' \
+                '  -s, --sudo              Use sudo when killing processes.' \
+                '  --full-match            Only fully matched files/titles will be removed.' \
+                '  -r, --regex             Use regular expression matching.' \
+                '  --preserve              Do not kill corresponding panes.' \
+                '  -a, --all               Clear all file monitors.' \
+                '  -S, --session SESSION   Target session (default: current, or latest if outside tmux).' \
+                '  -h, --help              Display this help and exit.' \
+                '' \
+                'Session Selection:' \
+                '  - Inside tmux: uses current session' \
+                '  - Outside tmux: uses latest session (does not create new)' \
                 '' \
                 'Examples:' \
-                '  tmon kill 10          Remove monitor of temporary file 10.' \
-                '  tmon kill -t TITLE    Remove monitor with title TITLE.' \
-                '  tmon kill -a -P --preserve' \
-                '      Remove all file monitors and kill processes but preserve panes.' \
+                '  tmon kill 10             Remove monitor with ID 10.' \
+                '  tmon kill -t TITLE       Remove monitors with matching title.' \
+                '  tmon kill -a -P          Kill all monitors and their processes.' \
                 ''
   exit
 }
 
+#
+# tmon_kill - Kill monitors
+#
 tmon_kill() {
-  ARGUMENTS=$(getopt -o "t,f,p,P,s,a,h" -l "title,file,pid,process,sudo,help,full-match,all,preserve" -- "$@" 2>/dev/null) || _tmon_kill_help
+  local ARGUMENTS
+  ARGUMENTS=$(getopt -o "t,f,p,P,s,ar,h,S:" -l "title,file,pid,process,sudo,all,regex,help,full-match,preserve,session:" -- "$@" 2>/dev/null) || _tmon_kill_help
   eval "set -- ${ARGUMENTS}"
 
-  args=()
-  use_sudo=false
-  use_name=false
-  use_path=false
-  use_pid=false
-  kill=false
-  clear_all=false
-  regex=false
-  full_match=false
-  kill_panes=true
+  local args=()
+  local use_sudo=false
+  local use_name=false
+  local use_path=false
+  local use_pid=false
+  local kill=false
+  local clear_all=false
+  local regex=false
+  local full_match=false
+  local kill_panes=true
+  local session_id=""
+  
   while [ $# -gt 0 ]; do
     case "$1" in
       -t|--title)
@@ -815,6 +2537,10 @@ tmon_kill() {
         clear_all=true
         shift
         ;;
+      -S|--session)
+        session_id="$2"
+        shift 2
+        ;;
       -h|--help)
         _tmon_kill_help
         ;;
@@ -827,169 +2553,404 @@ tmon_kill() {
         ;;
     esac
   done
-
-  _prepare_tmp
-  monitor_file=$(_get_monitor_file)
-  monitor_tmpfile="${monitor_file}.tmp"
-
-  if [ ! -f "$monitor_file" ]; then
-    if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
-  else
-    if [ -f "$monitor_tmpfile" ]; then rm -f "$monitor_tmpfile"; fi
+  
+  # Resolve session (kill/clear never creates new sessions)
+  local resolved_session
+  resolved_session=$(_resolve_session_kill_clear "$session_id")
+  
+  if [ -z "$resolved_session" ]; then
+    echo "No session found." >&2
+    return 1
   fi
- 
- if [ $clear_all == true ]; then
-    _monitor_clear
-    if [ $kill == true ]; then
-      (cat "$monitor_file" 2>/dev/null; echo) | while IFS= read -r line; do
+  
+  session_id="$resolved_session"
+  _register_session "$session_id" "active"
+  
+  local session_name
+  session_name=$(_get_session_name_from_id "$session_id")
+  
+  _prepare_session_tmp "$session_id"
+  
+  local monitor_file monitor_tmpfile
+  monitor_file=$(_get_monitor_file "$session_id")
+  monitor_tmpfile="${monitor_file}.tmp"
+  
+  # Initialize files
+  if [ ! -f "$monitor_file" ]; then
+    if [ -f "$monitor_tmpfile" ]; then
+      mv -f "$monitor_tmpfile" "$monitor_file"
+    else
+      touch "$monitor_file"
+    fi
+  else
+    rm -f "$monitor_tmpfile"
+  fi
+  
+  # Handle clear all
+  if [ "$clear_all" == true ]; then
+    _monitor_clear "$session_id"
+    
+    if [ "$kill" == true ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
         if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then continue; fi
+        
+        local file title pid tmp dead
         IFS="|" read -r file title pid tmp dead <<< "$line"
+        
         if [ -n "$pid" ]; then
+          local child_pid
           child_pid=$(pgrep -P "$pid" || echo "$pid")
-          if [ $use_sudo == true ]; then
-            if _kill_process "\"$sudo\" kill" "$child_pid" "$pid"; then continue; fi
+          if [ "$use_sudo" == true ]; then
+            _kill_process "\"$sudo\" kill" "$child_pid" "$pid"
           else
-            if _kill_process kill "$child_pid" "$pid"; then continue; fi
+            _kill_process kill "$child_pid" "$pid"
           fi
-          echo "$line" >> "$monitor_tmpfile"
         fi
-      done
+      done < <(cat "$monitor_file" 2>/dev/null; echo)
     fi
-    if [ $kill_panes == true ]; then
-      tmux kill-pane -a -t 0
-      _set_layout
+    
+    if [ "$kill_panes" == true ]; then
+      _kill_all_panes_except_first "$session_id"
+      _set_layout "$session_id"
     fi
-    if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+    
+    > "$monitor_file"
     return
   fi
   
-  (cat "$monitor_file" 2>/dev/null; echo) | while IFS= read -r line; do
+  # Process individual kills
+  while IFS= read -r line || [ -n "$line" ]; do
     if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then continue; fi
+    
+    local file title pid tmp dead
     IFS="|" read -r file title pid tmp dead <<< "$line"
+    
+    # Handle already dead entries
     if [ -n "$dead" ]; then
-      if [ $kill == true ]; then
+      if [ "$kill" == true ] && [ -n "$pid" ]; then
+        local child_pid
         child_pid=$(pgrep -P "$pid" || echo "$pid")
-        if [ $use_sudo == true ]; then
-          if _kill_process "\"$sudo\" kill" "$child_pid" "$pid"; then continue; fi
+        if [ "$use_sudo" == true ]; then
+          _kill_process "\"$sudo\" kill" "$child_pid" "$pid"
         else
-          if _kill_process kill "$child_pid" "$pid"; then continue; fi
+          _kill_process kill "$child_pid" "$pid"
         fi
       fi
+      # Keep the dead entry in the file
       echo "$line" >> "$monitor_tmpfile"
       continue
     fi
-    matched=false
-    if [ $use_name == true -o $use_path == true ]; then
-      if [ $use_name == true ]; then target=$title; else target=$file; fi
+    
+    # Check for match
+    local matched=false
+    local target
+    
+    if [ "$use_name" == true ] || [ "$use_path" == true ]; then
+      if [ "$use_name" == true ]; then
+        target="$title"
+      else
+        target="$file"
+      fi
+      
       for value in "${args[@]}"; do
-        if [ $full_match == true ]; then
-          if [ $regex == true ]; then
-            if [ -n "$(echo "$target" | grep -E -x "$value")" ]; then matched=true; break; fi
+        if [ "$full_match" == true ]; then
+          if [ "$regex" == true ]; then
+            if echo "$target" | grep -E -q "^${value}$"; then
+              matched=true
+              break
+            fi
           else
-            if [ "$target" == "$value" ]; then matched=true; break; fi
+            if [ "$target" == "$value" ]; then
+              matched=true
+              break
+            fi
           fi
         else
-          if [ $regex == true ]; then
-            if [ -n "$(echo "$target" | grep -E "$value")" ]; then matched=true; break; fi
+          if [ "$regex" == true ]; then
+            if echo "$target" | grep -qE "$value"; then
+              matched=true
+              break
+            fi
           else
-            if expr "$target" : ".*$value" >/dev/null; then matched=true; break; fi
+            if expr "$target" : ".*${value}" >/dev/null; then
+              matched=true
+              break
+            fi
           fi
         fi
       done
     else
-      if [ $use_pid == true ]; then target=$pid; else target=$tmp; fi
+      if [ "$use_pid" == true ]; then
+        target="$pid"
+      else
+        target="$tmp"
+      fi
+      
       if [ -n "$target" ]; then
         for value in "${args[@]}"; do
-          if [ "$target" == "$value" ]; then matched=true; break; fi
+          if [ "$target" == "$value" ]; then
+            matched=true
+            break
+          fi
         done
       fi
     fi
-    if [ $matched == true ]; then
-      killed=$kill
-      if [ $kill == true -a -n "$pid" ]; then
+    
+    if [ "$matched" == true ]; then
+      local killed=$kill
+      
+      if [ "$kill" == true ] && [ -n "$pid" ]; then
+        local child_pid
         child_pid=$(pgrep -P "$pid" || echo "$pid")
-        if [ $use_sudo == true ]; then
-          if _kill_process "\"$sudo\" kill" "$child_pid" "$pid"; then :; else killed=false; fi
+        if [ "$use_sudo" == true ]; then
+          if _kill_process "\"$sudo\" kill" "$child_pid" "$pid"; then
+            :
+          else
+            killed=false
+          fi
         else
-          if _kill_process kill "$child_pid" "$pid"; then :; else killed=false; fi
+          if _kill_process kill "$child_pid" "$pid"; then
+            :
+          else
+            killed=false
+          fi
         fi
       fi
-      if [ $killed == true -o -z "$pid" ]; then
+      
+      if [ "$killed" == true ] || [ -z "$pid" ]; then
+        # Fully killed, clean up temp files
         if [ -n "$tmp" ]; then
           echo "Killed $tmp"
-          tmp_stdout=$(_get_tmp_stdout "$tmp")
-          if [ -f "$tmp_stdout" ]; then rm -f "$tmp_stdout"; fi
-          tmp_stderr=$(_get_tmp_stderr "$tmp")
-          if [ -f "$tmp_stderr" ]; then rm -f "$tmp_stderr"; fi
+          local tmp_stdout tmp_stderr
+          tmp_stdout=$(_get_tmp_stdout "$tmp" "$session_id")
+          tmp_stderr=$(_get_tmp_stderr "$tmp" "$session_id")
+          rm -f "$tmp_stdout" "$tmp_stderr"
         else
           echo "Killed"
         fi
       else
-        if [ -n "$tmp" ]; then echo "Killed $tmp"; else echo "Killed"; fi
+        # Process still running, mark as dead
+        if [ -n "$tmp" ]; then
+          echo "Killed $tmp"
+        else
+          echo "Killed"
+        fi
         echo "$file|$title|$pid|$tmp|dead" >> "$monitor_tmpfile"
       fi
-      if [ $kill_panes == true -a -n "$title" ]; then
-        for pane_id in $(_find_panes_by_title "$title"); do
-          tmux kill-pane -t "$pane_id"
+      
+      # Kill associated panes
+      if [ "$kill_panes" == true ] && [ -n "$title" ]; then
+        local pane_id
+        for pane_id in $(_find_panes_by_title "$title" "$session_id"); do
+          _kill_pane "$pane_id" "$session_id"
         done
       fi
     else
+      # Not matched, preserve
       echo "$line" >> "$monitor_tmpfile"
     fi
-  done
-  if [ $kill_panes == true ]; then _set_layout; fi
-  if [ -f "$monitor_tmpfile" ]; then mv -f "$monitor_tmpfile" "$monitor_file"; else touch "$monitor_file"; fi
+  done < "$monitor_file"
+  
+  if [ "$kill_panes" == true ]; then
+    _set_layout "$session_id"
+  fi
+  
+  # Replace original file with updated version
+  if [ -f "$monitor_tmpfile" ]; then
+    mv -f "$monitor_tmpfile" "$monitor_file"
+  else
+    # All entries were processed, create empty file
+    : > "$monitor_file"
+  fi
 }
 
+
+# ============================================================================
+# COMMAND: tmon clear
+# Clear all panes except first
+# ============================================================================
+
+#
+# _tmon_clear_help - Show help for clear command
+#
+_tmon_clear_help() {
+  printf '%s\n' 'tmon clear [-S | --session SESSION] [-h | --help]' \
+                'Close all panes but preserve file monitors.' \
+                '' \
+                '  -S, --session SESSION   Target session (default: current, or latest if outside tmux).' \
+                '  -h, --help              Display this help and exit.' \
+                '' \
+                'Session Selection:' \
+                '  - Inside tmux: uses current session' \
+                '  - Outside tmux: uses latest session (does not create new)' \
+                '' \
+                'Examples:' \
+                '  tmon clear              Clear current/latest session.' \
+                '  tmon clear -S mysess    Clear specific session.' \
+                ''
+  exit
+}
+
+#
+# tmon_clear - Clear panes
+#
+tmon_clear() {
+  local ARGUMENTS
+  ARGUMENTS=$(getopt -o "hS:" -l "help,session:" -- "$@" 2>/dev/null) || _tmon_clear_help
+  eval "set -- ${ARGUMENTS}"
+  
+  local session_id=""
+  
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -S|--session)
+        session_id="$2"
+        shift 2
+        ;;
+      -h|--help)
+        _tmon_clear_help
+        ;;
+      --)
+        shift
+        ;;
+      *)
+        _tmon_clear_help
+        ;;
+    esac
+  done
+  
+  # Resolve session (clear never creates new sessions)
+  local resolved_session
+  resolved_session=$(_resolve_session_kill_clear "$session_id")
+  
+  if [ -z "$resolved_session" ]; then
+    echo "No session found." >&2
+    return 1
+  fi
+  
+  session_id="$resolved_session"
+  _register_session "$session_id" "active"
+  
+  _kill_all_panes_except_first "$session_id"
+}
+
+# ============================================================================
+# COMMAND: tmon exit
+# Exit current tmux session
+# ============================================================================
+
+#
+# _tmon_exit_help - Show help for exit command
+#
+_tmon_exit_help() {
+  printf '%s\n' 'tmon exit [-h | --help]' \
+                'Exit current tmux session.' \
+                '' \
+                '  -h, --help    Display this help and exit.' \
+                ''
+  exit
+}
+
+#
+# tmon_exit - Exit current session
+#
+tmon_exit() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _tmon_exit_help
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  
+  local current_session
+  current_session=$(_get_current_session_id)
+  
+  if [ -n "$current_session" ]; then
+    _kill_session "$current_session"
+  else
+    echo "Not in a tmux session." >&2
+    return 1
+  fi
+}
+
+# ============================================================================
+# HELP AND MAIN ENTRY
+# ============================================================================
+
+#
+# _help - Show main help
+#
 _help() {
   printf "%s\n" 'tmon COMMAND [...]' \
                 '' \
                 'A file and process monitor shell script based on tmux.' \
                 '' \
                 'Commands:' \
-                '  ps       List file monitors.' \
-                '  open     Create a file monitor and show file content in a pane.' \
-                '  monitor  Show monitored files in panes.' \
-                '  kill     Remove a file monitor and corresponding panes.' \
-                '  clear    Close other tmux panes.' \
-                '  exit     Exit tmux.' \
+                '  session   Manage tmon sessions (list, create, switch, kill).' \
+                '  ps        List file monitors from all or specific session.' \
+                '  open      Create a file monitor and show file content in a pane.' \
+                '  exec      Execute command and capture output in panes.' \
+                '  monitor   Show monitored files in panes.' \
+                '  kill      Remove file monitors and corresponding panes.' \
+                '  clear     Close all panes except first.' \
+                '  exit      Exit current tmux session.' \
+                '' \
+                'Global Options:' \
+                '  -S, --session SESSION   Target specific session (see command help for defaults).' \
                 '' \
                 "Run 'tmon COMMAND --help' for more information on a command." \
                 ''
   exit
 }
 
-subparser=$1
-shift
+#
+# Main entry point
+#
+main() {
+  # Check for help or no arguments
+  if [ $# -eq 0 ] || [ "$1" == "-h" ] || [ "$1" == "--help" ] || [ "$1" == "-help" ]; then
+    _help
+  fi
+  
+  local subparser="$1"
+  shift
+  
+  case "$subparser" in
+    session)
+      tmon_session "$@"
+      ;;
+    ps)
+      tmon_ps "$@"
+      ;;
+    open)
+      tmon_open "$@"
+      ;;
+    exec)
+      tmon_exec "$@"
+      ;;
+    monitor)
+      tmon_monitor "$@"
+      ;;
+    kill)
+      tmon_kill "$@"
+      ;;
+    clear)
+      tmon_clear "$@"
+      ;;
+    exit)
+      tmon_exit "$@"
+      ;;
+    *)
+      echo "Unknown command: $subparser" >&2
+      _help
+      ;;
+  esac
+}
 
-case "$subparser" in
-  -h|-help)
-    _help
-    exit
-    ;;
-  ps)
-    tmon_ps "$@"
-    ;;
-  open)
-    tmon_open "$@"
-    ;;
-  exec)
-    tmon_exec "$@"
-    ;;
-  monitor)
-    tmon_monitor "$@"
-    ;;
-  kill)
-    tmon_kill "$@"
-    ;;
-  clear)
-    tmon_clear "$@"
-    ;;
-  exit)
-    exit_session
-    ;;
-  *)
-    _help
-    ;;
-esac
+# Run main function
+main "$@"
 
