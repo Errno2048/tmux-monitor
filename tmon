@@ -1558,14 +1558,7 @@ _tmon_session_switch() {
     
     # If no current session, we're outside tmux - just attach to target
     if [ -z "$current_session" ]; then
-      # Check if there's only one session
-      local session_count
-      session_count=$(_list_sessions | wc -l)
-      if [ "$session_count" -eq 1 ]; then
-        echo "No other sessions available." >&2
-        return 1
-      fi
-      # Multiple sessions exist, attach to the first one
+      # Attach to the target session (even if it's the only one)
       _register_session "$target_session" "active"
       _attach_session "$target_session"
       return 0

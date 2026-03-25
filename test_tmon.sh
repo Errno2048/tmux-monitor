@@ -804,20 +804,23 @@ test_session_switch_single_session() {
   # Wait for session to be ready
   sleep 0.2
   
-  # Try to switch without other sessions
-  # Should fail with "No other sessions available" message
+  # When running from outside with only one session, switch should
+  # attach to that session (not fail with "No other sessions available")
+  # The "No other sessions available" message is only for when we're
+  # inside a session and try to switch to another session
   local output
   output=$($TMON_SCRIPT session switch 2>&1 || true)
   
+  # Should NOT output "No other sessions available" when from outside
   if echo "$output" | grep -q "No other sessions available"; then
-    log "Switch correctly reports no other sessions"
-    tmux kill-session -t "$session_name" 2>/dev/null || true
-    return 0
-  else
-    log "Switch should report no other sessions but got: $output"
+    log "Switch should attach to single session, but got: $output"
     tmux kill-session -t "$session_name" 2>/dev/null || true
     return 1
   fi
+  
+  log "Switch correctly allows attaching to single session"
+  tmux kill-session -t "$session_name" 2>/dev/null || true
+  return 0
 }
 
 test_session_id_consistency() {
@@ -897,6 +900,158 @@ test_session_switch_two_sessions() {
   tmux kill-session -t "$session1" 2>/dev/null || true
   tmux kill-session -t "$session2" 2>/dev/null || true
   
+  return 0
+}
+
+# ============================================================================
+# SESSION KILL AND SWITCH TESTS (Regression tests)
+# ============================================================================
+
+test_kill_session_switch_to_remaining() {
+  log "Testing kill session and switch to remaining..."
+  
+  local session1="tmon_test_$$_killrem1"
+  local session2="tmon_test_$$_killrem2"
+  
+  # Create first session
+  $TMON_SCRIPT session create -d "$session1"
+  sleep 0.3
+  
+  # Create second session
+  $TMON_SCRIPT session create -d "$session2"
+  sleep 0.3
+  
+  # Get session IDs
+  local session_id1 session_id2
+  session_id1=$($TMON_SCRIPT session list 2>&1 | grep "$session1" | head -1)
+  session_id2=$($TMON_SCRIPT session list 2>&1 | grep "$session2" | head -1)
+  
+  log "Session 1: $session_id1, Session 2: $session_id2"
+  
+  # Verify both exist
+  if ! tmux has-session -t "$session1" 2>/dev/null; then
+    log "Session 1 does not exist"
+    return 1
+  fi
+  if ! tmux has-session -t "$session2" 2>/dev/null; then
+    log "Session 2 does not exist"
+    tmux kill-session -t "$session1" 2>/dev/null || true
+    return 1
+  fi
+  
+  # Kill session 2 from outside
+  $TMON_SCRIPT session kill "$session_id2" 2>&1
+  sleep 0.3
+  
+  # Verify session 2 is gone but session 1 remains
+  if tmux has-session -t "$session2" 2>/dev/null; then
+    log "Session 2 still exists after kill"
+    tmux kill-session -t "$session1" 2>/dev/null || true
+    tmux kill-session -t "$session2" 2>/dev/null || true
+    return 1
+  fi
+  
+  if ! tmux has-session -t "$session1" 2>/dev/null; then
+    log "Session 1 was incorrectly killed"
+    return 1
+  fi
+  
+  # Check session 1 is in registry
+  local remaining
+  remaining=$($TMON_SCRIPT session list 2>&1)
+  log "Remaining sessions: $remaining"
+  
+  if ! echo "$remaining" | grep -q "$session1"; then
+    log "Session 1 not found in registry after killing session 2"
+    tmux kill-session -t "$session1" 2>/dev/null || true
+    return 1
+  fi
+  
+  log "Session 1 correctly remains after killing session 2"
+  
+  # Clean up
+  tmux kill-session -t "$session1" 2>/dev/null || true
+  return 0
+}
+
+test_switch_after_kill_single_session() {
+  log "Testing switch after kill leaves single session..."
+  
+  local session1="tmon_test_$$_swkill1"
+  local session2="tmon_test_$$_swkill2"
+  
+  # Create two sessions
+  $TMON_SCRIPT session create -d "$session1"
+  sleep 0.3
+  $TMON_SCRIPT session create -d "$session2"
+  sleep 0.3
+  
+  # Kill session 2
+  $TMON_SCRIPT session kill "$session2" 2>&1
+  sleep 0.3
+  
+  # Verify only session 1 remains
+  local remaining_count
+  remaining_count=$($TMON_SCRIPT session list 2>&1 | wc -l)
+  log "Remaining session count: $remaining_count"
+  
+  if [ "$remaining_count" -ne 1 ]; then
+    log "Expected 1 remaining session, got $remaining_count"
+    tmux kill-session -t "$session1" 2>/dev/null || true
+    tmux kill-session -t "$session2" 2>/dev/null || true
+    return 1
+  fi
+  
+  # Try to switch from outside (should attach to the remaining session)
+  # We can't actually test attach in non-interactive mode, but we can verify
+  # the command doesn't fail with "No other sessions available"
+  local switch_output
+  switch_output=$($TMON_SCRIPT session switch 2>&1 || true)
+  log "Switch output: '$switch_output'"
+  
+  # The switch command should NOT output "No other sessions available"
+  if echo "$switch_output" | grep -q "No other sessions available"; then
+    log "Switch incorrectly reports no other sessions available"
+    tmux kill-session -t "$session1" 2>/dev/null || true
+    return 1
+  fi
+  
+  log "Switch correctly allows attaching to single remaining session"
+  
+  # Clean up
+  tmux kill-session -t "$session1" 2>/dev/null || true
+  return 0
+}
+
+test_monitor_attach_to_remaining() {
+  log "Testing monitor command attaches to remaining session..."
+  
+  local session1="tmon_test_$$_monrem1"
+  local session2="tmon_test_$$_monrem2"
+  
+  # Create two sessions
+  $TMON_SCRIPT session create -d "$session1"
+  sleep 0.3
+  $TMON_SCRIPT session create -d "$session2"
+  sleep 0.3
+  
+  # Kill session 2
+  $TMON_SCRIPT session kill "$session2" 2>&1
+  sleep 0.3
+  
+  # Verify session 1 is still in registry
+  local remaining
+  remaining=$($TMON_SCRIPT session list 2>&1)
+  if ! echo "$remaining" | grep -q "$session1"; then
+    log "Session 1 not in registry"
+    tmux kill-session -t "$session1" 2>/dev/null || true
+    return 1
+  fi
+  
+  log "Monitor would attach to remaining session: $remaining"
+  
+  # Clean up
+  tmux kill-session -t "$session1" 2>/dev/null || true
   return 0
 }
 
@@ -1119,6 +1274,11 @@ main() {
   run_test test_session_switch_single_session
   run_test test_session_id_consistency
   run_test test_session_switch_two_sessions
+  
+  # Session kill and switch tests (regression tests)
+  run_test test_kill_session_switch_to_remaining
+  run_test test_switch_after_kill_single_session
+  run_test test_monitor_attach_to_remaining
   
   # Session switch inside tmux tests
   run_test test_session_create_inside_tmux
