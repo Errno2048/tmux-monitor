@@ -2023,8 +2023,8 @@ tmon_open() {
   if [ "$detached" != true ]; then
     _set_layout "$session_id"
     
-    # Attach if we created a new session and we're not in tmux
-    if [ "$_resolve_session_created" == true ] && [ "$(in_session)" == "0" ]; then
+    # Attach if we're not in tmux
+    if [ "$(in_session)" == "0" ]; then
       _attach_session "$session_id"
     fi
   fi
@@ -2240,8 +2240,8 @@ tmon_exec() {
     
     _set_layout "$session_id"
     
-    # Attach if we created a new session and we're not in tmux
-    if [ "$_resolve_session_created" == true ] && [ "$(in_session)" == "0" ]; then
+    # Attach if we're not in tmux
+    if [ "$(in_session)" == "0" ]; then
       _attach_session "$session_id"
     fi
   fi
